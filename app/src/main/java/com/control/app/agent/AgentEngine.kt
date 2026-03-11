@@ -1,12 +1,16 @@
 package com.control.app.agent
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
 import android.util.Log
+import android.widget.Toast
 import com.control.app.adb.AdbExecutor
 import com.control.app.ai.OpenAIClient
 import com.control.app.data.AppSettings
@@ -36,6 +40,7 @@ import java.util.Date
 import java.util.Locale
 
 class AgentEngine(
+    appContext: Context,
     private val adbExecutor: AdbExecutor,
     private val openAIClient: OpenAIClient,
     private val promptManager: PromptManager,
@@ -64,6 +69,9 @@ class AgentEngine(
     private val _overlayVisible = MutableStateFlow(true)
     val overlayVisible: StateFlow<Boolean> = _overlayVisible.asStateFlow()
 
+    private val appContext = appContext.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private var currentJob: Job? = null
 
     /** Maps element number (#N) to center (x, y) coordinates for the current screenshot. */
@@ -82,6 +90,26 @@ class AgentEngine(
      */
     private var currentZoomRect: android.graphics.RectF? = null
 
+    private fun setProgress(
+        currentRound: Int = _agentState.value.currentRound,
+        statusMessage: String = _agentState.value.statusMessage,
+        activeTool: String = _agentState.value.activeTool,
+        lastThinking: String = _agentState.value.lastThinking,
+        lastAction: String = _agentState.value.lastAction
+    ) {
+        val prev = _agentState.value
+        val now = System.currentTimeMillis()
+        _agentState.value = prev.copy(
+            currentRound = currentRound,
+            statusMessage = statusMessage,
+            activeTool = activeTool,
+            lastThinking = lastThinking,
+            lastAction = lastAction,
+            phaseStartedAtMs = if (statusMessage != prev.statusMessage) now else prev.phaseStartedAtMs,
+            lastProgressAtMs = now
+        )
+    }
+
     fun addLog(entry: DebugLogEntry) {
         _debugLog.value = _debugLog.value + entry
         sessionManager.addEntryToCurrentSession(entry)
@@ -91,13 +119,36 @@ class AgentEngine(
         _debugLog.value = emptyList()
     }
 
+    private fun showTaskCompletionToast(message: String) {
+        val singleLineMessage = message
+            .lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() }
+            ?: "任务完成"
+        val toastMessage = "任务结束: ${singleLineMessage.take(80)}" +
+            if (singleLineMessage.length > 80) "..." else ""
+
+        mainHandler.post {
+            Toast.makeText(appContext, toastMessage, Toast.LENGTH_LONG).show()
+        }
+    }
+
     suspend fun executeCommand(voiceCommand: String): String = coroutineScope {
         val settings = settingsStore.settings.first()
+
+        if (settings.apiEndpoint.isBlank()) {
+            val errorMsg = "API 端点未配置，请先在设置中填写"
+            addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "配置错误", content = errorMsg))
+            _agentState.value = AgentState(statusMessage = errorMsg)
+            showTaskCompletionToast(errorMsg)
+            return@coroutineScope errorMsg
+        }
 
         if (settings.apiKey.isBlank()) {
             val errorMsg = "API Key 未配置，请先在设置中填写"
             addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "配置错误", content = errorMsg))
             _agentState.value = AgentState(statusMessage = errorMsg)
+            showTaskCompletionToast(errorMsg)
             return@coroutineScope errorMsg
         }
 
@@ -105,17 +156,23 @@ class AgentEngine(
             val errorMsg = "ADB 未连接，请先在设置中连接无线调试"
             addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "ADB 错误", content = errorMsg))
             _agentState.value = AgentState(statusMessage = errorMsg)
+            showTaskCompletionToast(errorMsg)
             return@coroutineScope errorMsg
         }
 
         // Create a new session for this task
         val session = sessionManager.createSession(voiceCommand)
+        val startTime = System.currentTimeMillis()
 
         _agentState.value = AgentState(
             isRunning = true,
             currentRound = 0,
             maxRounds = settings.maxRounds,
-            statusMessage = "正在执行: $voiceCommand"
+            statusMessage = "正在执行: $voiceCommand",
+            lastAction = "收到指令",
+            taskStartedAtMs = startTime,
+            phaseStartedAtMs = startTime,
+            lastProgressAtMs = startTime
         )
 
         addLog(
@@ -140,8 +197,10 @@ class AgentEngine(
             })
 
             // Take initial screenshot + UI tree
-            _agentState.value = _agentState.value.copy(
-                statusMessage = "正在截图..."
+            setProgress(
+                statusMessage = "正在截图...",
+                activeTool = "",
+                lastAction = "准备初始截图与界面树"
             )
 
             val (imageBase64, screenshotWidth, screenshotHeight, uiTree) = captureScreen(settings.screenshotScale)
@@ -172,24 +231,22 @@ class AgentEngine(
             // Main tool-calling loop
             while (step < settings.maxRounds) {
                 step++
-                _agentState.value = _agentState.value.copy(
+                setProgress(
                     currentRound = step,
-                    statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在调用AI..."
+                    statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在调用AI...",
+                    activeTool = "",
+                    lastAction = "等待 AI 决策"
                 )
 
                 Log.d(TAG, "=== Step $step/${settings.maxRounds} ===")
 
-                // Log API request
-                val messageRoles = messageHistory.map { msg ->
-                    (msg["role"] as? JsonPrimitive)?.content ?: "unknown"
-                }
                 addLog(
                     DebugLogEntry(
                         type = DebugLogType.API_REQUEST,
                         title = "API 请求 (第${step}步)",
                         content = buildString {
+                            appendLine("准备发送 AI 请求")
                             appendLine("History messages: ${messageHistory.size}")
-                            appendLine("Message roles: ${messageRoles.joinToString(" -> ")}")
                             appendLine("Tools: ${ToolDefinitions.AGENT_TOOLS.size} defined")
                         }
                     )
@@ -201,7 +258,20 @@ class AgentEngine(
                     tools = ToolDefinitions.AGENT_TOOLS,
                     apiEndpoint = settings.apiEndpoint,
                     apiKey = settings.apiKey,
-                    modelName = settings.modelName
+                    modelName = settings.modelName,
+                    logHttp = { httpLog ->
+                        addLog(
+                            DebugLogEntry(
+                                type = if (httpLog.title.contains("响应")) {
+                                    DebugLogType.API_RESPONSE
+                                } else {
+                                    DebugLogType.API_REQUEST
+                                },
+                                title = "${httpLog.title} (第${step}步)",
+                                content = httpLog.content
+                            )
+                        )
+                    }
                 )
 
                 val result = apiResult.getOrElse { e ->
@@ -224,8 +294,10 @@ class AgentEngine(
                             )
                         )
 
-                        _agentState.value = _agentState.value.copy(
-                            lastThinking = result.content.take(200)
+                        setProgress(
+                            lastThinking = result.content.take(200),
+                            activeTool = "",
+                            lastAction = "AI 返回了最终文本响应"
                         )
 
                         resultMessage = result.content.ifBlank { "任务完成" }
@@ -252,8 +324,10 @@ class AgentEngine(
 
                         Log.d(TAG, "AI requested tools: $toolNames")
 
-                        _agentState.value = _agentState.value.copy(
-                            statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolNames.first()}..."
+                        setProgress(
+                            statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolNames.first()}...",
+                            activeTool = toolNames.first(),
+                            lastAction = "AI 规划了 ${toolNames.size} 个动作"
                         )
 
                         var taskCompleted = false
@@ -263,6 +337,12 @@ class AgentEngine(
                         // Execute each tool call and add results to history
                         for (toolCall in result.toolCalls) {
                             try {
+                                setProgress(
+                                    statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolCall.functionName}...",
+                                    activeTool = toolCall.functionName,
+                                    lastAction = "开始执行 ${toolCall.functionName}"
+                                )
+
                                 // Hide overlay before interactive actions
                                 val isInteractive = toolCall.functionName in listOf(
                                     "tap", "tap_element", "input_element", "swipe",
@@ -296,6 +376,10 @@ class AgentEngine(
                                 )
 
                                 Log.d(TAG, "Tool ${toolCall.functionName} done: ${toolResult.take(80)}")
+                                setProgress(
+                                    activeTool = toolCall.functionName,
+                                    lastAction = "${toolCall.functionName}: ${toolResult.take(80)}"
+                                )
 
                                 // Check if this was the "complete" tool
                                 if (toolCall.functionName == "complete") {
@@ -331,6 +415,11 @@ class AgentEngine(
                                     )
                                 )
                                 Log.e(TAG, errMsg, e)
+                                setProgress(
+                                    statusMessage = "第 ${step}/${settings.maxRounds} 步: ${toolCall.functionName} 失败",
+                                    activeTool = toolCall.functionName,
+                                    lastAction = errMsg.take(120)
+                                )
                             }
                         }
 
@@ -355,8 +444,10 @@ class AgentEngine(
 
                             // After executing tool calls, take a fresh screenshot and append as user message
                             // This gives the AI up-to-date visual context for its next decision
-                            _agentState.value = _agentState.value.copy(
-                                statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在截图..."
+                            setProgress(
+                                statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在截图...",
+                                activeTool = "",
+                                lastAction = "动作执行完成，刷新界面"
                             )
 
                             val (newImageBase64, newWidth, newHeight, newUiTree) = captureScreen(settings.screenshotScale)
@@ -412,10 +503,15 @@ class AgentEngine(
                 isRunning = false,
                 currentRound = step,
                 maxRounds = settings.maxRounds,
-                statusMessage = resultMessage
+                statusMessage = resultMessage,
+                lastAction = resultMessage,
+                taskStartedAtMs = startTime,
+                phaseStartedAtMs = System.currentTimeMillis(),
+                lastProgressAtMs = System.currentTimeMillis()
             )
             // Mark session as ended
             sessionManager.endCurrentSession(resultMessage)
+            showTaskCompletionToast(resultMessage)
         }
 
         addLog(
@@ -978,7 +1074,13 @@ class AgentEngine(
         currentJob?.cancel()
         currentJob = null
         _overlayVisible.value = true
-        _agentState.value = AgentState(statusMessage = "已取消")
+        val now = System.currentTimeMillis()
+        _agentState.value = AgentState(
+            statusMessage = "已取消",
+            lastAction = "用户取消任务",
+            phaseStartedAtMs = now,
+            lastProgressAtMs = now
+        )
     }
 
     fun setCurrentJob(job: Job) {

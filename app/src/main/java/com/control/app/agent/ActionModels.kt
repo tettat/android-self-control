@@ -56,5 +56,10 @@ data class AgentState(
     val maxRounds: Int = 50,
     val statusMessage: String = "就绪",
     val isListening: Boolean = false,
-    val lastThinking: String = ""
+    val lastThinking: String = "",
+    val activeTool: String = "",
+    val lastAction: String = "",
+    val taskStartedAtMs: Long = 0L,
+    val phaseStartedAtMs: Long = 0L,
+    val lastProgressAtMs: Long = 0L
 )

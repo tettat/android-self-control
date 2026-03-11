@@ -59,7 +59,7 @@ class ControlApp : Application() {
         openAIClient = OpenAIClient()
         sessionManager = SessionManager()
         skillStore = SkillStore(this)
-        agentEngine = AgentEngine(adbExecutor, openAIClient, promptManager, settingsStore, sessionManager, skillStore)
+        agentEngine = AgentEngine(this, adbExecutor, openAIClient, promptManager, settingsStore, sessionManager, skillStore)
         executionLogHttpServer = ExecutionLogHttpServer(this, agentEngine)
         executionLogHttpServer.start()
         relayLogSyncManager = RelayLogSyncManager(this, settingsStore, agentEngine, executionLogHttpServer)
@@ -141,6 +141,7 @@ class ControlApp : Application() {
         relayLogSyncManager.stop()
         executionLogHttpServer.stop()
         adbExecutor.mdnsDiscovery.stopDiscovery()
+        openAIClient.shutdown()
         super.onTerminate()
     }
 }

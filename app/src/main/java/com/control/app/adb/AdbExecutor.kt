@@ -8,6 +8,9 @@ import io.github.muntashirakon.adb.AdbStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * Replacement for ShizukuExecutor. Uses libadb-android to connect to the device's
@@ -24,6 +27,9 @@ class AdbExecutor(private val context: Context) {
         private const val LOCALHOST = "127.0.0.1"
         private const val DEFAULT_CONNECT_TIMEOUT_MS = 10_000
         private const val MAX_RECONNECT_ATTEMPTS = 2
+        private const val DEFAULT_SHELL_TIMEOUT_MS = 15_000L
+        private const val SCREENSHOT_TIMEOUT_MS = 20_000L
+        private const val UI_DUMP_TIMEOUT_MS = 20_000L
     }
 
     private val connectionManager: AdbConnectionManagerImpl by lazy {
@@ -150,32 +156,41 @@ class AdbExecutor(private val context: Context) {
      * Execute a shell command via ADB and return stdout as a string.
      * Automatically reconnects if the connection was lost.
      */
-    suspend fun executeCommand(command: String): Result<String> = withContext(Dispatchers.IO) {
+    suspend fun executeCommand(
+        command: String,
+        timeoutMs: Long = DEFAULT_SHELL_TIMEOUT_MS
+    ): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            Log.d(TAG, "Executing: ${command.take(100)}")
+            Log.d(TAG, "Executing: ${command.take(100)} (timeout=${timeoutMs}ms)")
             val stream = openStreamWithReconnect("shell:$command")
-            val output = readStreamFully(stream)
-            stream.close()
-            output
+            try {
+                readStreamFully(stream, timeoutMs)
+            } finally {
+                runCatching { stream.close() }
+            }
         }
     }
 
     /**
      * Read all data from an ADB stream until it closes.
      */
-    private fun readStreamFully(stream: AdbStream): String {
+    private fun readStreamFully(stream: AdbStream, timeoutMs: Long): String {
         val baos = ByteArrayOutputStream()
         val inputStream = stream.openInputStream()
-        val buffer = ByteArray(4096)
-        while (true) {
-            val bytesRead = try {
-                inputStream.read(buffer)
-            } catch (e: Exception) {
-                // Stream closed or EOF
-                break
+        runWithTimeout(timeoutMs, onTimeout = {
+            runCatching { inputStream.close() }
+            runCatching { stream.close() }
+        }) {
+            val buffer = ByteArray(4096)
+            while (true) {
+                val bytesRead = try {
+                    inputStream.read(buffer)
+                } catch (e: Exception) {
+                    break
+                }
+                if (bytesRead == -1) break
+                baos.write(buffer, 0, bytesRead)
             }
-            if (bytesRead == -1) break
-            baos.write(buffer, 0, bytesRead)
         }
         return baos.toString("UTF-8")
     }
@@ -183,20 +198,43 @@ class AdbExecutor(private val context: Context) {
     /**
      * Read binary data from an ADB stream until it closes.
      */
-    private fun readStreamBytes(stream: AdbStream): ByteArray {
+    private fun readStreamBytes(stream: AdbStream, timeoutMs: Long): ByteArray {
         val baos = ByteArrayOutputStream()
         val inputStream = stream.openInputStream()
-        val buffer = ByteArray(8192)
-        while (true) {
-            val bytesRead = try {
-                inputStream.read(buffer)
-            } catch (e: Exception) {
-                break
+        runWithTimeout(timeoutMs, onTimeout = {
+            runCatching { inputStream.close() }
+            runCatching { stream.close() }
+        }) {
+            val buffer = ByteArray(8192)
+            while (true) {
+                val bytesRead = try {
+                    inputStream.read(buffer)
+                } catch (e: Exception) {
+                    break
+                }
+                if (bytesRead == -1) break
+                baos.write(buffer, 0, bytesRead)
             }
-            if (bytesRead == -1) break
-            baos.write(buffer, 0, bytesRead)
         }
         return baos.toByteArray()
+    }
+
+    private fun <T> runWithTimeout(
+        timeoutMs: Long,
+        onTimeout: () -> Unit = {},
+        block: () -> T
+    ): T {
+        val executor = Executors.newSingleThreadExecutor()
+        val future = executor.submit<T> { block() }
+        return try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (e: TimeoutException) {
+            onTimeout()
+            future.cancel(true)
+            throw RuntimeException("ADB 命令超时 (${timeoutMs}ms)", e)
+        } finally {
+            executor.shutdownNow()
+        }
     }
 
     /**
@@ -211,7 +249,7 @@ class AdbExecutor(private val context: Context) {
             // This avoids filesystem permission issues.
             val pngBytes = try {
                 val stream = openStreamWithReconnect("shell:screencap -p")
-                val bytes = readStreamBytes(stream)
+                val bytes = readStreamBytes(stream, SCREENSHOT_TIMEOUT_MS)
                 stream.close()
                 bytes
             } catch (e: Exception) {
@@ -245,18 +283,18 @@ class AdbExecutor(private val context: Context) {
     private fun screenshotViaFile(): ByteArray {
         // Take screenshot to temp file
         val saveStream = openStreamWithReconnect("shell:screencap -p $SCREENSHOT_PATH")
-        readStreamFully(saveStream)
+        readStreamFully(saveStream, SCREENSHOT_TIMEOUT_MS)
         saveStream.close()
 
         // Read the file contents back via cat
         val catStream = openStreamWithReconnect("shell:cat $SCREENSHOT_PATH")
-        val bytes = readStreamBytes(catStream)
+        val bytes = readStreamBytes(catStream, SCREENSHOT_TIMEOUT_MS)
         catStream.close()
 
         // Clean up temp file
         try {
             val rmStream = openStreamWithReconnect("shell:rm -f $SCREENSHOT_PATH")
-            readStreamFully(rmStream)
+            readStreamFully(rmStream, DEFAULT_SHELL_TIMEOUT_MS)
             rmStream.close()
         } catch (_: Exception) { }
 
@@ -330,15 +368,17 @@ class AdbExecutor(private val context: Context) {
         runCatching {
             Log.d(TAG, "Launch app: $packageName")
             val result = executeCommand(
-                "monkey -p $packageName -c android.intent.category.LAUNCHER 1 2>&1"
+                "monkey -p $packageName -c android.intent.category.LAUNCHER 1 2>&1",
+                timeoutMs = 12_000L
             ).getOrThrow()
 
             if (result.contains("No activities found") || result.contains("Error")) {
                 val launchActivity = executeCommand(
-                    "cmd package resolve-activity --brief $packageName | tail -n 1"
+                    "cmd package resolve-activity --brief $packageName | tail -n 1",
+                    timeoutMs = 8_000L
                 ).getOrThrow().trim()
                 if (launchActivity.contains("/")) {
-                    executeCommand("am start -n $launchActivity").getOrThrow()
+                    executeCommand("am start -n $launchActivity", timeoutMs = 8_000L).getOrThrow()
                 } else {
                     throw RuntimeException("Cannot find launcher activity for $packageName")
                 }
@@ -350,8 +390,14 @@ class AdbExecutor(private val context: Context) {
 
     suspend fun dumpUiHierarchy(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            executeCommand("uiautomator dump /data/local/tmp/ui_dump.xml 2>&1").getOrThrow()
-            val xml = executeCommand("cat /data/local/tmp/ui_dump.xml").getOrThrow()
+            executeCommand(
+                "uiautomator dump /data/local/tmp/ui_dump.xml 2>&1",
+                timeoutMs = UI_DUMP_TIMEOUT_MS
+            ).getOrThrow()
+            val xml = executeCommand(
+                "cat /data/local/tmp/ui_dump.xml",
+                timeoutMs = UI_DUMP_TIMEOUT_MS
+            ).getOrThrow()
             executeCommand("rm -f /data/local/tmp/ui_dump.xml")
             xml
         }

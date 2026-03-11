@@ -33,6 +33,7 @@ import android.widget.TextView
 import androidx.core.app.NotificationCompat
 import com.control.app.ControlApp
 import com.control.app.MainActivity
+import com.control.app.agent.AgentState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -100,6 +101,8 @@ class FloatingBubbleService : Service() {
     private var isListening = false
     private var isAgentRunning = false
     private var pulseAnimator: ObjectAnimator? = null
+    private var overlayTickerJob: Job? = null
+    private var latestAgentState: AgentState = AgentState()
 
     private var speechRecognizer: SpeechRecognizer? = null
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -121,6 +124,7 @@ class FloatingBubbleService : Service() {
         observeAgentState()
         observeOverlayVisibility()
         observeOverlaySetting()
+        startOverlayTicker()
         _isRunning.value = true
     }
 
@@ -134,6 +138,7 @@ class FloatingBubbleService : Service() {
     override fun onDestroy() {
         _isRunning.value = false
         stopPulse()
+        overlayTickerJob?.cancel()
         serviceScope.cancel()
         destroySpeechRecognizer()
         try { windowManager.removeView(bubbleView) } catch (_: Exception) {}
@@ -467,6 +472,7 @@ class FloatingBubbleService : Service() {
     private fun observeAgentState() {
         serviceScope.launch {
             app.agentEngine.agentState.collect { state ->
+                latestAgentState = state
                 mainHandler.post {
                     val wasRunning = isAgentRunning
                     isAgentRunning = state.isRunning
@@ -488,13 +494,7 @@ class FloatingBubbleService : Service() {
 
                     // Update overlay panel
                     if (state.isRunning && showOverlaySetting) {
-                        val text = buildString {
-                            append("第${state.currentRound}/${state.maxRounds}轮 | ${state.statusMessage}")
-                            if (state.lastThinking.isNotBlank()) {
-                                append("\n\uD83D\uDCAD ${state.lastThinking.take(150)}")
-                            }
-                        }
-                        overlayPanel?.text = text
+                        overlayPanel?.text = buildOverlayText(state)
                         overlayPanel?.visibility = View.VISIBLE
                     } else {
                         overlayPanel?.visibility = View.GONE
@@ -534,6 +534,50 @@ class FloatingBubbleService : Service() {
                 }
             }
         }
+    }
+
+    private fun startOverlayTicker() {
+        overlayTickerJob?.cancel()
+        overlayTickerJob = serviceScope.launch {
+            while (isActive) {
+                delay(1000)
+                mainHandler.post {
+                    if (isAgentRunning && showOverlaySetting) {
+                        overlayPanel?.text = buildOverlayText(latestAgentState)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun buildOverlayText(state: AgentState): String {
+        val now = System.currentTimeMillis()
+        val totalSeconds = ((now - state.taskStartedAtMs).coerceAtLeast(0L)) / 1000
+        val phaseSeconds = ((now - state.phaseStartedAtMs).coerceAtLeast(0L)) / 1000
+        val idleSeconds = ((now - state.lastProgressAtMs).coerceAtLeast(0L)) / 1000
+
+        return buildString {
+            append("第${state.currentRound}/${state.maxRounds}轮 | ${state.statusMessage}")
+            if (state.activeTool.isNotBlank()) {
+                append("\n工具: ${state.activeTool}")
+            }
+            if (state.lastAction.isNotBlank()) {
+                append("\n进展: ${state.lastAction.take(120)}")
+            }
+            append("\n总耗时 ${formatDuration(totalSeconds)} | 当前阶段 ${formatDuration(phaseSeconds)}")
+            if (idleSeconds >= 5) {
+                append(" | 无新进展 ${formatDuration(idleSeconds)}")
+            }
+            if (state.lastThinking.isNotBlank()) {
+                append("\n思路: ${state.lastThinking.take(120)}")
+            }
+        }
+    }
+
+    private fun formatDuration(totalSeconds: Long): String {
+        val minutes = totalSeconds / 60
+        val seconds = totalSeconds % 60
+        return if (minutes > 0) "${minutes}m${seconds}s" else "${seconds}s"
     }
 
     private fun updateBubbleColor(color: Int) {

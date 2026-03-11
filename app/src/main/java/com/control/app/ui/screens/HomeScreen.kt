@@ -73,6 +73,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -113,6 +114,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -305,6 +307,13 @@ fun HomeScreen(
     val voiceText by viewModel.voiceText.collectAsStateWithLifecycle()
     val isListening by viewModel.isListening.collectAsStateWithLifecycle()
     val partialText by viewModel.partialText.collectAsStateWithLifecycle()
+    val nowMs by produceState(initialValue = System.currentTimeMillis(), key1 = agentState.isRunning) {
+        value = System.currentTimeMillis()
+        while (agentState.isRunning) {
+            delay(1000)
+            value = System.currentTimeMillis()
+        }
+    }
 
     val context = LocalContext.current
     var hasAudioPermission by remember {
@@ -478,7 +487,8 @@ fun HomeScreen(
                 StatusIndicator(
                     agentState = agentState,
                     isListening = isListening,
-                    partialText = partialText
+                    partialText = partialText,
+                    nowMs = nowMs
                 )
 
                 Spacer(modifier = Modifier.height(8.dp))
@@ -802,7 +812,8 @@ private fun MicButton(
 private fun StatusIndicator(
     agentState: AgentState,
     isListening: Boolean,
-    partialText: String
+    partialText: String,
+    nowMs: Long
 ) {
     val statusText: String
     val statusColor: Color
@@ -822,23 +833,79 @@ private fun StatusIndicator(
         }
     }
 
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center
+    val totalSeconds = if (agentState.taskStartedAtMs > 0L) {
+        ((nowMs - agentState.taskStartedAtMs).coerceAtLeast(0L)) / 1000
+    } else 0L
+    val phaseSeconds = if (agentState.phaseStartedAtMs > 0L) {
+        ((nowMs - agentState.phaseStartedAtMs).coerceAtLeast(0L)) / 1000
+    } else 0L
+    val idleSeconds = if (agentState.lastProgressAtMs > 0L) {
+        ((nowMs - agentState.lastProgressAtMs).coerceAtLeast(0L)) / 1000
+    } else 0L
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Box(
-            modifier = Modifier
-                .size(8.dp)
-                .clip(CircleShape)
-                .background(statusColor)
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-            text = statusText,
-            style = MaterialTheme.typography.titleMedium,
-            color = statusColor
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(statusColor)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = statusText,
+                style = MaterialTheme.typography.titleMedium,
+                color = statusColor
+            )
+        }
+
+        if (agentState.isRunning) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = buildString {
+                    append("总耗时 ${formatDuration(totalSeconds)}")
+                    append(" | 当前阶段 ${formatDuration(phaseSeconds)}")
+                    if (idleSeconds >= 5) {
+                        append(" | 无新进展 ${formatDuration(idleSeconds)}")
+                    }
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            if (agentState.activeTool.isNotBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "当前工具: ${agentState.activeTool}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            if (agentState.lastAction.isNotBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "最近进展: ${agentState.lastAction}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
     }
+}
+
+private fun formatDuration(totalSeconds: Long): String {
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return if (minutes > 0) "${minutes}m${seconds}s" else "${seconds}s"
 }
 
 @Composable

@@ -17,6 +17,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -28,6 +29,11 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 class OpenAIClient {
+
+    data class HttpLogEntry(
+        val title: String,
+        val content: String
+    )
 
     companion object {
         private const val TAG = "OpenAIClient"
@@ -41,6 +47,7 @@ class OpenAIClient {
     }
 
     private val httpClient = OkHttpClient.Builder()
+        .callTimeout(90, TimeUnit.SECONDS)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -55,7 +62,8 @@ class OpenAIClient {
         tools: JsonArray,
         apiEndpoint: String,
         apiKey: String,
-        modelName: String
+        modelName: String,
+        logHttp: ((HttpLogEntry) -> Unit)? = null
     ): Result<AIChatResult> = withContext(Dispatchers.IO) {
         runCatching {
             val requestBody = buildToolRequestBody(modelName, messages, tools)
@@ -74,7 +82,14 @@ class OpenAIClient {
                 .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
-            val responseBody = executeRequest(request)
+            logHttp?.invoke(
+                HttpLogEntry(
+                    title = "AI 请求详情",
+                    content = buildRequestLog(request, requestJson)
+                )
+            )
+
+            val responseBody = executeRequest(request, logHttp)
             parseToolResponse(responseBody)
         }
     }
@@ -187,7 +202,10 @@ class OpenAIClient {
         }
     }
 
-    private suspend fun executeRequest(request: Request): String {
+    private suspend fun executeRequest(
+        request: Request,
+        logHttp: ((HttpLogEntry) -> Unit)?
+    ): String {
         return suspendCancellableCoroutine { continuation ->
             val call = httpClient.newCall(request)
 
@@ -197,6 +215,16 @@ class OpenAIClient {
 
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
+                    logHttp?.invoke(
+                        HttpLogEntry(
+                            title = "AI 请求失败",
+                            content = buildString {
+                                appendLine("Method: ${request.method}")
+                                appendLine("URL: ${request.url}")
+                                appendLine("Error: ${e.message}")
+                            }.trimEnd()
+                        )
+                    )
                     if (!continuation.isCancelled) {
                         continuation.resumeWithException(
                             RuntimeException("Network request failed: ${e.message}", e)
@@ -207,6 +235,12 @@ class OpenAIClient {
                 override fun onResponse(call: Call, response: Response) {
                     try {
                         val body = response.body?.string() ?: ""
+                        logHttp?.invoke(
+                            HttpLogEntry(
+                                title = "AI 响应详情",
+                                content = buildResponseLog(response, body)
+                            )
+                        )
 
                         if (!response.isSuccessful) {
                             val errorMsg = try {
@@ -230,6 +264,49 @@ class OpenAIClient {
                 }
             })
         }
+    }
+
+    private fun buildRequestLog(request: Request, requestJson: String): String = buildString {
+        appendLine("Method: ${request.method}")
+        appendLine("URL: ${request.url}")
+        appendLine("Headers:")
+        appendLine(formatHeaders(request.headers))
+        appendLine("Body:")
+        append(requestJson)
+    }
+
+    private fun buildResponseLog(response: Response, body: String): String = buildString {
+        appendLine("Status: ${response.code} ${response.message}")
+        appendLine("URL: ${response.request.url}")
+        appendLine("Headers:")
+        appendLine(formatHeaders(response.headers))
+        appendLine("Body:")
+        append(body.ifBlank { "<empty>" })
+    }
+
+    private fun formatHeaders(headers: Headers): String {
+        if (headers.size == 0) return "  <none>"
+        return headers.names()
+            .sorted()
+            .joinToString("\n") { name ->
+                val value = if (name.equals("Authorization", ignoreCase = true)) {
+                    redactAuthorization(headers[name].orEmpty())
+                } else {
+                    headers.values(name).joinToString(", ")
+                }
+                "  $name: $value"
+            }
+    }
+
+    private fun redactAuthorization(value: String): String {
+        if (value.isBlank()) return value
+        val trimmed = value.trim()
+        val parts = trimmed.split(" ", limit = 2)
+        if (parts.size != 2) return "***"
+        val scheme = parts[0]
+        val token = parts[1]
+        val visible = token.takeLast(minOf(6, token.length))
+        return "$scheme ***$visible"
     }
 
     /**
@@ -263,7 +340,7 @@ class OpenAIClient {
                 .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
-            val responseBody = executeRequest(request)
+            val responseBody = executeRequest(request, null)
             val chatResponse = json.decodeFromString<ChatResponse>(responseBody)
             chatResponse.choices.firstOrNull()?.message?.content ?: ""
         }
