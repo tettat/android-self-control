@@ -43,6 +43,10 @@ class ControlApp : Application() {
         skillStore = SkillStore(this)
         agentEngine = AgentEngine(adbExecutor, openAIClient, promptManager, settingsStore, sessionManager, skillStore)
 
+        appScope.launch(Dispatchers.IO) {
+            settingsStore.removeEmbeddedApiDefaultsIfPresent()
+        }
+
         // Restore last connected port so auto-reconnect works across app restarts
         appScope.launch(Dispatchers.IO) {
             val port = settingsStore.adbLastConnectPort.first()

@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
@@ -17,9 +18,9 @@ import com.control.app.BuildConfig
 private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "settings")
 
 data class AppSettings(
-    val apiEndpoint: String = "https://api.openai.com/v1",
-    val apiKey: String = "",
-    val modelName: String = "gpt-5.2",
+    val apiEndpoint: String = BuildConfig.DEFAULT_API_ENDPOINT,
+    val apiKey: String = BuildConfig.DEFAULT_API_KEY,
+    val modelName: String = "qwen3.5-plus",
     val maxRounds: Int = 50,
     val screenshotScale: Float = 0.5f,
     val voiceLanguage: String = "zh-CN",
@@ -30,6 +31,10 @@ data class AppSettings(
 )
 
 class SettingsStore(private val context: Context) {
+
+    private companion object {
+        const val LEGACY_DEFAULT_API_ENDPOINT = "https://coding.dashscope.aliyuncs.com/v1"
+    }
 
     private object Keys {
         val API_ENDPOINT = stringPreferencesKey("api_endpoint")
@@ -172,6 +177,19 @@ class SettingsStore(private val context: Context) {
     suspend fun updateRelayUrl(value: String) {
         context.dataStore.edit { prefs ->
             prefs[Keys.RELAY_URL] = value
+        }
+    }
+
+    suspend fun removeEmbeddedApiDefaultsIfPresent() {
+        val currentSettings = settings.first()
+        val shouldClearEndpoint = currentSettings.apiEndpoint == LEGACY_DEFAULT_API_ENDPOINT
+
+        if (!shouldClearEndpoint) return
+
+        context.dataStore.edit { prefs ->
+            if (shouldClearEndpoint) {
+                prefs.remove(Keys.API_ENDPOINT)
+            }
         }
     }
 }

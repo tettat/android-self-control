@@ -19,6 +19,73 @@ if (envFile.exists()) {
     }
 }
 
+val cleartextDomains = envProps.getOrDefault("CLEARTEXT_DOMAINS", "")
+    .split(",")
+    .map { it.trim() }
+    .filter { it.isNotEmpty() }
+    .distinct()
+
+fun escapeXml(value: String): String = value
+    .replace("&", "&amp;")
+    .replace("<", "&lt;")
+    .replace(">", "&gt;")
+    .replace("\"", "&quot;")
+    .replace("'", "&apos;")
+
+fun asBuildConfigString(value: String): String = buildString {
+    append('"')
+    value.forEach { ch ->
+        when (ch) {
+            '\\' -> append("\\\\")
+            '"' -> append("\\\"")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            '\t' -> append("\\t")
+            else -> append(ch)
+        }
+    }
+    append('"')
+}
+
+val generatedNetworkSecurityResDir = layout.buildDirectory.dir("generated/res/networkSecurityConfig")
+val generateNetworkSecurityConfig = tasks.register("generateNetworkSecurityConfig") {
+    outputs.dir(generatedNetworkSecurityResDir)
+
+    doLast {
+        val outputFile = generatedNetworkSecurityResDir.get()
+            .file("xml/network_security_config.xml")
+            .asFile
+
+        outputFile.parentFile.mkdirs()
+
+        val allowedDomains = (listOf("localhost", "127.0.0.1", "10.0.2.2") + cleartextDomains)
+            .distinct()
+
+        val domainEntries = allowedDomains.joinToString("\n") { domain ->
+            """        <domain includeSubdomains="true">${escapeXml(domain)}</domain>"""
+        }
+
+        outputFile.writeText(
+            buildString {
+                appendLine("""<?xml version="1.0" encoding="utf-8"?>""")
+                appendLine("<network-security-config>")
+                appendLine("    <!-- Allow cleartext traffic only for explicitly configured local/dev hosts -->")
+                appendLine("    <domain-config cleartextTrafficPermitted=\"true\">")
+                appendLine(domainEntries)
+                appendLine("    </domain-config>")
+                appendLine()
+                appendLine("    <!-- Default: only allow HTTPS -->")
+                appendLine("    <base-config cleartextTrafficPermitted=\"false\">")
+                appendLine("        <trust-anchors>")
+                appendLine("            <certificates src=\"system\" />")
+                appendLine("        </trust-anchors>")
+                appendLine("    </base-config>")
+                appendLine("</network-security-config>")
+            }
+        )
+    }
+}
+
 android {
     namespace = "com.control.app"
     compileSdk = 34
@@ -40,7 +107,17 @@ android {
         buildConfigField(
             "String",
             "DEFAULT_RELAY_URL",
-            "\"${envProps.getOrDefault("DEFAULT_RELAY_URL", "")}\""
+            asBuildConfigString(envProps.getOrDefault("DEFAULT_RELAY_URL", ""))
+        )
+        buildConfigField(
+            "String",
+            "DEFAULT_API_ENDPOINT",
+            asBuildConfigString(envProps.getOrDefault("DEFAULT_API_ENDPOINT", ""))
+        )
+        buildConfigField(
+            "String",
+            "DEFAULT_API_KEY",
+            asBuildConfigString(envProps.getOrDefault("DEFAULT_API_KEY", ""))
         )
     }
 
@@ -83,6 +160,14 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+
+    sourceSets.getByName("main") {
+        res.srcDir(generatedNetworkSecurityResDir)
+    }
+}
+
+tasks.named("preBuild").configure {
+    dependsOn(generateNetworkSecurityConfig)
 }
 
 dependencies {
