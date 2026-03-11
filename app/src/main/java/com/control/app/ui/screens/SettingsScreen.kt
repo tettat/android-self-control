@@ -19,8 +19,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
@@ -60,6 +62,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -81,6 +84,55 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+
+@Composable
+private fun PersistedTextField(
+    value: String,
+    onCommit: (String) -> Unit,
+    label: @Composable () -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: @Composable (() -> Unit)? = null,
+    singleLine: Boolean = false,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
+    trailingIcon: @Composable (() -> Unit)? = null,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default
+) {
+    var localValue by remember(value) { mutableStateOf(value) }
+    var isEditing by remember { mutableStateOf(false) }
+
+    if (!isEditing && localValue != value) {
+        localValue = value
+    }
+
+    fun commitIfChanged() {
+        isEditing = false
+        if (localValue != value) {
+            onCommit(localValue)
+        }
+    }
+
+    OutlinedTextField(
+        value = localValue,
+        onValueChange = {
+            isEditing = true
+            localValue = it
+        },
+        label = label,
+        placeholder = placeholder,
+        singleLine = singleLine,
+        visualTransformation = visualTransformation,
+        trailingIcon = trailingIcon,
+        keyboardOptions = keyboardOptions.copy(imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { commitIfChanged() }),
+        modifier = modifier.onFocusChanged { focusState ->
+            if (focusState.isFocused) {
+                isEditing = true
+            } else if (isEditing) {
+                commitIfChanged()
+            }
+        }
+    )
+}
 
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as ControlApp
@@ -114,14 +166,12 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     init {
         refreshAdbStatus()
-        app.adbExecutor.mdnsDiscovery.startDiscovery()
-        tryAutoConnect()
+        app.ensureAdbReady()
     }
 
     override fun onCleared() {
         super.onCleared()
         stopRemotePairing()
-        app.adbExecutor.mdnsDiscovery.stopDiscovery()
     }
 
     fun refreshAdbStatus() {
@@ -430,11 +480,11 @@ fun SettingsScreen(
             // API Configuration
             SectionHeader(title = "API 配置")
             SettingsCard {
-                OutlinedTextField(
+                PersistedTextField(
                     value = settings.apiEndpoint,
-                    onValueChange = { scope.launch { viewModel.updateApiEndpoint(it) } },
+                    onCommit = { scope.launch { viewModel.updateApiEndpoint(it) } },
                     label = { Text("API 端点") },
-                    placeholder = { Text("https://api.openai.com/v1") },
+                    placeholder = { Text("https://coding.dashscope.aliyuncs.com/v1") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -442,9 +492,9 @@ fun SettingsScreen(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 var showApiKey by remember { mutableStateOf(false) }
-                OutlinedTextField(
+                PersistedTextField(
                     value = settings.apiKey,
-                    onValueChange = { scope.launch { viewModel.updateApiKey(it) } },
+                    onCommit = { scope.launch { viewModel.updateApiKey(it) } },
                     label = { Text("API 密钥") },
                     placeholder = { Text("sk-...") },
                     singleLine = true,

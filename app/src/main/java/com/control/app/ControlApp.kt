@@ -11,10 +11,20 @@ import com.control.app.prompt.PromptManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class ControlApp : Application() {
+
+    data class AdbStartupState(
+        val isReady: Boolean = false,
+        val isConnecting: Boolean = false,
+        val needsPairing: Boolean = false,
+        val message: String? = null
+    )
 
     lateinit var settingsStore: SettingsStore
         private set
@@ -32,6 +42,8 @@ class ControlApp : Application() {
         private set
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private val _adbStartupState = MutableStateFlow(AdbStartupState())
+    val adbStartupState: StateFlow<AdbStartupState> = _adbStartupState.asStateFlow()
 
     override fun onCreate() {
         super.onCreate()
@@ -42,6 +54,7 @@ class ControlApp : Application() {
         sessionManager = SessionManager()
         skillStore = SkillStore(this)
         agentEngine = AgentEngine(adbExecutor, openAIClient, promptManager, settingsStore, sessionManager, skillStore)
+        adbExecutor.mdnsDiscovery.startDiscovery()
 
         appScope.launch(Dispatchers.IO) {
             settingsStore.removeEmbeddedApiDefaultsIfPresent()
@@ -53,6 +66,69 @@ class ControlApp : Application() {
             if (port > 0) {
                 adbExecutor.lastConnectedPort = port
             }
+            ensureAdbReady()
         }
+    }
+
+    fun ensureAdbReady() {
+        appScope.launch(Dispatchers.IO) {
+            if (adbExecutor.isConnected()) {
+                _adbStartupState.value = AdbStartupState(
+                    isReady = true,
+                    message = "ADB 已连接"
+                )
+                return@launch
+            }
+
+            val currentSettings = settingsStore.settings.first()
+            if (!currentSettings.adbPaired) {
+                _adbStartupState.value = AdbStartupState(
+                    needsPairing = true,
+                    message = "未检测到配对信息，请前往设置完成首次配对"
+                )
+                return@launch
+            }
+
+            _adbStartupState.value = AdbStartupState(
+                isConnecting = true,
+                message = "正在自动连接 ADB..."
+            )
+
+            kotlinx.coroutines.delay(2000)
+
+            val mdnsPort = adbExecutor.mdnsDiscovery.connectService.value?.port
+            val lastPort = currentSettings.adbLastConnectPort.takeIf { it > 0 }
+            val candidatePorts = listOfNotNull(mdnsPort, lastPort).distinct()
+
+            if (candidatePorts.isEmpty()) {
+                _adbStartupState.value = AdbStartupState(
+                    needsPairing = true,
+                    message = "未发现可用的无线调试端口，请前往设置重新配对"
+                )
+                return@launch
+            }
+
+            for (port in candidatePorts) {
+                val result = adbExecutor.connect(port)
+                if (result.isSuccess) {
+                    settingsStore.updateAdbLastConnectPort(port)
+                    _adbStartupState.value = AdbStartupState(
+                        isReady = true,
+                        message = "ADB 已自动连接"
+                    )
+                    return@launch
+                }
+            }
+
+            _adbStartupState.value = AdbStartupState(
+                needsPairing = true,
+                message = "自动连接失败，请前往设置重新输入配对信息"
+            )
+        }
+    }
+
+    override fun onTerminate() {
+        adbExecutor.mdnsDiscovery.stopDiscovery()
+        super.onTerminate()
     }
 }

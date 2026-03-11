@@ -125,6 +125,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as ControlApp
     val agentState = app.agentEngine.agentState
     val debugLog = app.agentEngine.debugLog
+    val adbStartupState = app.adbStartupState
 
     private val _voiceText = MutableStateFlow("")
     val voiceText: StateFlow<String> = _voiceText.asStateFlow()
@@ -242,6 +243,10 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         app.agentEngine.cancel()
     }
 
+    fun ensureAdbReady() {
+        app.ensureAdbReady()
+    }
+
     /**
      * Export all debug log entries to a JSON file and return its content URI for sharing.
      */
@@ -316,6 +321,7 @@ fun HomeScreen(
 ) {
     val agentState by viewModel.agentState.collectAsStateWithLifecycle()
     val debugLog by viewModel.debugLog.collectAsStateWithLifecycle()
+    val adbStartupState by viewModel.adbStartupState.collectAsStateWithLifecycle()
     val voiceText by viewModel.voiceText.collectAsStateWithLifecycle()
     val isListening by viewModel.isListening.collectAsStateWithLifecycle()
     val partialText by viewModel.partialText.collectAsStateWithLifecycle()
@@ -344,6 +350,10 @@ fun HomeScreen(
 
     // Text input state
     var textInput by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        viewModel.ensureAdbReady()
+    }
 
     Scaffold(
         topBar = {
@@ -474,6 +484,15 @@ fun HomeScreen(
                 }
 
                 Spacer(modifier = Modifier.height(8.dp))
+
+                AdbStartupCard(
+                    state = adbStartupState,
+                    onOpenSettings = { navController.navigate(Routes.SETTINGS) }
+                )
+
+                if (adbStartupState.message != null) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
 
                 // Status text
                 StatusIndicator(
@@ -612,6 +631,75 @@ fun HomeScreen(
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AdbStartupCard(
+    state: ControlApp.AdbStartupState,
+    onOpenSettings: () -> Unit
+) {
+    if (state.isReady || state.message.isNullOrBlank()) return
+
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = if (state.needsPairing) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceContainerHigh
+            }
+        ),
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (state.needsPairing) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            StatusColors.Processing
+                        }
+                    )
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (state.needsPairing) "ADB 未配对" else "ADB 连接中",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (state.needsPairing) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    }
+                )
+                Text(
+                    text = state.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = if (state.needsPairing) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+            }
+            if (state.needsPairing) {
+                TextButton(onClick = onOpenSettings) {
+                    Text("去设置")
+                }
             }
         }
     }
