@@ -4,11 +4,13 @@ const path = require('path');
 
 const PORT = 3000;
 const CHANNEL_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const DEVICE_LOG_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 // ---------------------------------------------------------------------------
 // In-memory store: Map<channelId, { data: {...} | null, createdAt: number }>
 // ---------------------------------------------------------------------------
 const channels = new Map();
+const deviceLogs = new Map();
 
 function getChannel(channelId) {
   const entry = channels.get(channelId);
@@ -29,12 +31,34 @@ function ensureChannel(channelId) {
   return entry;
 }
 
+function getDeviceLog(deviceId) {
+  const entry = deviceLogs.get(deviceId);
+  if (!entry) return null;
+  if (Date.now() - entry.updatedAt > DEVICE_LOG_TTL_MS) {
+    deviceLogs.delete(deviceId);
+    return null;
+  }
+  return entry;
+}
+
+function setDeviceLog(deviceId, snapshot) {
+  deviceLogs.set(deviceId, {
+    snapshot,
+    updatedAt: Date.now(),
+  });
+}
+
 // Periodic cleanup of expired channels (every 60 s)
 setInterval(() => {
   const now = Date.now();
   for (const [id, entry] of channels) {
     if (now - entry.createdAt > CHANNEL_TTL_MS) {
       channels.delete(id);
+    }
+  }
+  for (const [id, entry] of deviceLogs) {
+    if (now - entry.updatedAt > DEVICE_LOG_TTL_MS) {
+      deviceLogs.delete(id);
     }
   }
 }, 60_000);
@@ -84,7 +108,203 @@ const rootHtml = `<!DOCTYPE html>
 <div class="container">
   <h1>Control ADB Pairing</h1>
   <p>请从 Control App 获取配对链接</p>
+  <p style="margin-top: 12px;"><a href="/logs" style="color: #90caf9;">查看设备执行日志</a></p>
 </div>
+</body>
+</html>`;
+
+const logsHtml = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Control Logs</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(180deg, #0e1720 0%, #13212e 100%);
+    color: #e8eef3;
+  }
+  .page {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 24px 16px 48px;
+  }
+  .hero, .panel, .entry {
+    background: rgba(18, 29, 40, 0.9);
+    border: 1px solid rgba(144, 202, 249, 0.16);
+    border-radius: 18px;
+  }
+  .hero, .panel {
+    padding: 20px;
+    margin-bottom: 16px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: 280px minmax(0, 1fr);
+    gap: 16px;
+  }
+  .devices {
+    display: grid;
+    gap: 10px;
+  }
+  .device {
+    width: 100%;
+    padding: 12px;
+    border-radius: 14px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .device.active {
+    border-color: #42a5f5;
+    background: rgba(66,165,245,0.14);
+  }
+  .meta {
+    color: #90a4ae;
+    font-size: 13px;
+    line-height: 1.6;
+  }
+  .entries {
+    display: grid;
+    gap: 12px;
+  }
+  .entry {
+    padding: 14px;
+  }
+  .entry h3 {
+    margin: 0 0 8px;
+    font-size: 15px;
+  }
+  .entry pre {
+    margin: 0;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+    line-height: 1.55;
+  }
+  .pill {
+    display: inline-block;
+    padding: 4px 8px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+    font-size: 12px;
+    margin-right: 8px;
+  }
+  a { color: #90caf9; }
+  @media (max-width: 900px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="hero">
+    <h1 style="margin: 0 0 8px;">Control Relay Logs</h1>
+    <div class="meta">这里展示通过 App 主动同步到 relay server 的最新执行日志。页面每 5 秒自动刷新一次。</div>
+  </div>
+
+  <div class="grid">
+    <section class="panel">
+      <h2 style="margin-top: 0;">设备</h2>
+      <div id="devices" class="devices"></div>
+    </section>
+
+    <section class="panel">
+      <div id="summary" class="meta">正在加载...</div>
+      <div id="entries" class="entries" style="margin-top: 16px;"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+const state = { selectedId: null, timer: null };
+
+function escapeHtml(value) {
+  return String(value || '')
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+async function loadDevices() {
+  const res = await fetch('/api/device-logs');
+  const data = await res.json();
+  const devices = data.devices || [];
+  if (!state.selectedId && devices.length > 0) {
+    state.selectedId = devices[0].deviceId;
+  }
+  renderDevices(devices);
+  if (state.selectedId) {
+    await loadDevice(state.selectedId);
+  } else {
+    document.getElementById('summary').textContent = '暂无设备日志';
+    document.getElementById('entries').innerHTML = '';
+  }
+}
+
+function renderDevices(devices) {
+  const container = document.getElementById('devices');
+  if (!devices.length) {
+    container.innerHTML = '<div class="meta">暂无设备同步日志</div>';
+    return;
+  }
+  container.innerHTML = devices.map(device => {
+    const active = device.deviceId === state.selectedId ? ' active' : '';
+    return '<button class="device' + active + '" onclick="selectDevice(\\'' + escapeHtml(device.deviceId) + '\\')">' +
+      '<div><strong>' + escapeHtml(device.deviceName || device.deviceId) + '</strong></div>' +
+      '<div class="meta">' + escapeHtml(device.statusMessage || '无状态') + '</div>' +
+      '<div class="meta">' + escapeHtml(device.updatedAtFormatted || '') + ' · ' + (device.entryCount || 0) + ' 条日志</div>' +
+      '</button>';
+  }).join('');
+}
+
+async function loadDevice(deviceId) {
+  const res = await fetch('/api/device-logs/' + encodeURIComponent(deviceId));
+  if (!res.ok) {
+    document.getElementById('summary').textContent = '设备日志不存在或已过期';
+    document.getElementById('entries').innerHTML = '';
+    return;
+  }
+  const snapshot = await res.json();
+  renderDevice(snapshot);
+}
+
+function renderDevice(snapshot) {
+  const stateInfo = snapshot.agentState || {};
+  const urls = ((snapshot.logServer && snapshot.logServer.accessUrls) || [])
+    .map(url => '<a href="' + escapeHtml(url) + '">' + escapeHtml(url) + '</a>')
+    .join(' , ');
+  document.getElementById('summary').innerHTML =
+    '<div><strong>' + escapeHtml(snapshot.deviceName || snapshot.deviceId || '未知设备') + '</strong></div>' +
+    '<div class="meta">状态: ' + escapeHtml(stateInfo.statusMessage || '无') + '</div>' +
+    '<div class="meta">最后同步: ' + escapeHtml(snapshot.relaySyncedAtFormatted || snapshot.exportTime || '') + '</div>' +
+    '<div class="meta">手机日志地址: ' + (urls || '无') + '</div>';
+
+  const entries = snapshot.entries || [];
+  document.getElementById('entries').innerHTML = entries.slice().reverse().map(entry => (
+    '<article class="entry">' +
+      '<div><span class="pill">' + escapeHtml(entry.type) + '</span><span class="meta">' + escapeHtml(entry.timestampFormatted) + '</span></div>' +
+      '<h3>' + escapeHtml(entry.title) + '</h3>' +
+      '<pre>' + escapeHtml(entry.content) + '</pre>' +
+    '</article>'
+  )).join('');
+}
+
+async function selectDevice(deviceId) {
+  state.selectedId = deviceId;
+  await loadDevices();
+}
+
+loadDevices();
+state.timer = setInterval(loadDevices, 5000);
+</script>
 </body>
 </html>`;
 
@@ -418,6 +638,50 @@ function handleDeletePairing(res, channelId) {
   json(res, 200, { ok: true });
 }
 
+function handlePostDeviceLogs(req, res, deviceId) {
+  parseBody(req).then(snapshot => {
+    const safeSnapshot = {
+      ...snapshot,
+      deviceId,
+      deviceName: snapshot.deviceName || deviceId,
+      relaySyncedAt: Date.now(),
+      relaySyncedAtFormatted: new Date().toISOString(),
+    };
+    setDeviceLog(deviceId, safeSnapshot);
+    console.log(`[${new Date().toISOString()}] [device:${deviceId}] Log snapshot updated (${(safeSnapshot.entries || []).length} entries)`);
+    json(res, 200, { ok: true });
+  }).catch(() => {
+    json(res, 400, { error: 'Invalid JSON' });
+  });
+}
+
+function handleGetDeviceLog(res, deviceId) {
+  const entry = getDeviceLog(deviceId);
+  if (!entry) {
+    json(res, 404, { error: 'Device log not found' });
+    return;
+  }
+  json(res, 200, entry.snapshot);
+}
+
+function handleGetDeviceLogList(res) {
+  const devices = [];
+  for (const [deviceId, entry] of deviceLogs) {
+    const snapshot = getDeviceLog(deviceId)?.snapshot;
+    if (!snapshot) continue;
+    devices.push({
+      deviceId,
+      deviceName: snapshot.deviceName || deviceId,
+      updatedAt: entry.updatedAt,
+      updatedAtFormatted: new Date(entry.updatedAt).toISOString(),
+      entryCount: Array.isArray(snapshot.entries) ? snapshot.entries.length : 0,
+      statusMessage: snapshot.agentState?.statusMessage || '',
+    });
+  }
+  devices.sort((a, b) => b.updatedAt - a.updatedAt);
+  json(res, 200, { devices });
+}
+
 // ---------------------------------------------------------------------------
 // HTTP server
 // ---------------------------------------------------------------------------
@@ -477,6 +741,30 @@ const server = http.createServer((req, res) => {
     if (req.method === 'GET') { handleGetPairing(res, DEFAULT_CH); return; }
     if (req.method === 'POST') { handlePostPairing(req, res, DEFAULT_CH); return; }
     if (req.method === 'DELETE') { handleDeletePairing(res, DEFAULT_CH); return; }
+  }
+
+  if (pathname === '/logs' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    res.end(logsHtml);
+    return;
+  }
+
+  if (pathname === '/api/device-logs' && req.method === 'GET') {
+    handleGetDeviceLogList(res);
+    return;
+  }
+
+  const deviceLogsMatch = pathname.match(/^\/api\/device-logs\/([A-Za-z0-9_-]+)$/);
+  if (deviceLogsMatch) {
+    const deviceId = deviceLogsMatch[1];
+    if (req.method === 'GET') {
+      handleGetDeviceLog(res, deviceId);
+      return;
+    }
+    if (req.method === 'POST') {
+      handlePostDeviceLogs(req, res, deviceId);
+      return;
+    }
   }
 
   // ------------------------------------------------------------------

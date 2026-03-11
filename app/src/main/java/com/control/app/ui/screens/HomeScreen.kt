@@ -4,7 +4,6 @@ import android.Manifest
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -105,6 +104,7 @@ import com.control.app.ControlApp
 import com.control.app.agent.AgentState
 import com.control.app.agent.DebugLogEntry
 import com.control.app.agent.DebugLogType
+import com.control.app.log.ExecutionLogFormatter
 import com.control.app.service.FloatingBubbleService
 import com.control.app.ui.navigation.Routes
 import com.control.app.ui.theme.GradientColors
@@ -114,8 +114,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -255,41 +253,23 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         if (entries.isEmpty()) return null
 
         try {
-            val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
-            val timestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
-
-            val root = JSONObject().apply {
-                put("exportTime", dateFormat.format(Date()))
-                put("deviceInfo", "${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, SDK ${Build.VERSION.SDK_INT})")
-                put("appVersion", try {
-                    val pInfo = app.packageManager.getPackageInfo(app.packageName, 0)
-                    "${pInfo.versionName} (${pInfo.longVersionCode})"
-                } catch (_: Exception) { "unknown" })
-                put("entryCount", entries.size)
-
-                val jsonEntries = JSONArray()
-                for (entry in entries) {
-                    val obj = JSONObject().apply {
-                        put("id", entry.id)
-                        put("timestamp", entry.timestamp)
-                        put("timestampFormatted", timestampFormat.format(Date(entry.timestamp)))
-                        put("type", entry.type.name)
-                        put("title", entry.title)
-                        put("content", entry.content)
-                        put("hasImage", entry.imageBase64 != null)
-                        if (entry.imageBase64 != null) {
-                            put("imageSizeKB", entry.imageBase64.length * 3 / 4 / 1024)
-                        }
-                    }
-                    jsonEntries.put(obj)
-                }
-                put("entries", jsonEntries)
-            }
+            val logServerStatus = app.executionLogHttpServer.status.value
+            val root = ExecutionLogFormatter.buildExportJson(
+                context = app,
+                agentState = app.agentEngine.agentState.value,
+                entries = entries,
+                sessions = app.sessionManager.sessions.value,
+                serverPort = logServerStatus.port.takeIf { it > 0 },
+                accessUrls = logServerStatus.accessUrls
+            )
 
             val debugDir = app.getExternalFilesDir("debug") ?: return null
             if (!debugDir.exists()) debugDir.mkdirs()
 
-            val fileTimestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+            val fileTimestamp = ExecutionLogFormatter.buildExportTime()
+                .replace(":", "")
+                .replace("-", "")
+                .replace("T", "_")
             val file = File(debugDir, "control_debug_$fileTimestamp.json")
             file.writeText(root.toString(2))
 

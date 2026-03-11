@@ -7,6 +7,8 @@ import com.control.app.agent.SessionManager
 import com.control.app.agent.SkillStore
 import com.control.app.ai.OpenAIClient
 import com.control.app.data.SettingsStore
+import com.control.app.log.ExecutionLogHttpServer
+import com.control.app.log.RelayLogSyncManager
 import com.control.app.prompt.PromptManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -40,6 +42,10 @@ class ControlApp : Application() {
         private set
     lateinit var agentEngine: AgentEngine
         private set
+    lateinit var executionLogHttpServer: ExecutionLogHttpServer
+        private set
+    lateinit var relayLogSyncManager: RelayLogSyncManager
+        private set
 
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val _adbStartupState = MutableStateFlow(AdbStartupState())
@@ -54,6 +60,10 @@ class ControlApp : Application() {
         sessionManager = SessionManager()
         skillStore = SkillStore(this)
         agentEngine = AgentEngine(adbExecutor, openAIClient, promptManager, settingsStore, sessionManager, skillStore)
+        executionLogHttpServer = ExecutionLogHttpServer(this, agentEngine)
+        executionLogHttpServer.start()
+        relayLogSyncManager = RelayLogSyncManager(this, settingsStore, agentEngine, executionLogHttpServer)
+        relayLogSyncManager.start()
         adbExecutor.mdnsDiscovery.startDiscovery()
 
         appScope.launch(Dispatchers.IO) {
@@ -128,6 +138,8 @@ class ControlApp : Application() {
     }
 
     override fun onTerminate() {
+        relayLogSyncManager.stop()
+        executionLogHttpServer.stop()
         adbExecutor.mdnsDiscovery.stopDiscovery()
         super.onTerminate()
     }

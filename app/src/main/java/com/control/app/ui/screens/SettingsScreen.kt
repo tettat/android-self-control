@@ -21,6 +21,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.material.icons.Icons
@@ -75,6 +76,7 @@ import androidx.navigation.NavController
 import com.control.app.ControlApp
 import com.control.app.adb.PairingRelayClient
 import com.control.app.data.AppSettings
+import com.control.app.log.ExecutionLogServerStatus
 import com.control.app.ui.navigation.Routes
 import com.control.app.ui.theme.StatusColors
 import kotlinx.coroutines.Job
@@ -149,6 +151,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     val isOperating: StateFlow<Boolean> = _isOperating.asStateFlow()
 
     val connectService = app.adbExecutor.mdnsDiscovery.connectService
+    val executionLogServerStatus = app.executionLogHttpServer.status
 
     // Remote pairing relay (created dynamically per session)
     private var relayClient: PairingRelayClient? = null
@@ -176,6 +179,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun refreshAdbStatus() {
         _adbStatus.value = AdbStatus(isConnected = app.adbExecutor.isConnected())
+        app.executionLogHttpServer.refreshStatus()
     }
 
     /**
@@ -413,6 +417,10 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun refreshLogServerStatus() {
+        app.executionLogHttpServer.refreshStatus()
+    }
+
     suspend fun updateApiEndpoint(value: String) = app.settingsStore.updateApiEndpoint(value)
     suspend fun updateApiKey(value: String) = app.settingsStore.updateApiKey(value)
     suspend fun updateModelName(value: String) = app.settingsStore.updateModelName(value)
@@ -440,6 +448,7 @@ fun SettingsScreen(
     val isPolling by viewModel.isPolling.collectAsStateWithLifecycle()
     val relayError by viewModel.relayError.collectAsStateWithLifecycle()
     val currentChannelUrl by viewModel.currentChannelUrl.collectAsStateWithLifecycle()
+    val executionLogServerStatus by viewModel.executionLogServerStatus.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
 
     Scaffold(
@@ -665,6 +674,12 @@ fun SettingsScreen(
                 onTestConnection = { viewModel.testConnection() },
                 onRefresh = { viewModel.refreshAdbStatus() },
                 onResetPairing = { viewModel.resetPairing() }
+            )
+
+            SectionHeader(title = "日志访问")
+            ExecutionLogAccessCard(
+                serverStatus = executionLogServerStatus,
+                onRefresh = { viewModel.refreshLogServerStatus() }
             )
 
             // Xiaomi/MIUI Tips
@@ -1074,6 +1089,78 @@ private fun AdbConnectionCard(
 }
 
 @Composable
+private fun ExecutionLogAccessCard(
+    serverStatus: ExecutionLogServerStatus,
+    onRefresh: () -> Unit
+) {
+    SettingsCard {
+        StatusRow(
+            label = "日志服务",
+            isOk = serverStatus.isRunning,
+            okText = "已启动",
+            badText = "未启动"
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "同一局域网内优先使用第一个地址访问，即可读取当前手机上的执行日志。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        SelectionContainer {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                serverStatus.accessUrls.forEach { url ->
+                    Text(
+                        text = url,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "浏览器页面: /\nJSON 日志: /api/logs\n会话列表: /api/sessions\n健康检查: /health",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "说明: 这是只读接口，返回当前 App 进程内的执行日志；App 在运行时即可访问。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        serverStatus.errorMessage?.let { message ->
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall,
+                color = StatusColors.Error
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        OutlinedButton(
+            onClick = onRefresh,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("刷新日志地址")
+        }
+    }
+}
+
+@Composable
 private fun SectionHeader(title: String) {
     Text(
         text = title,
@@ -1103,7 +1190,12 @@ private fun SettingsCard(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun StatusRow(label: String, isOk: Boolean) {
+private fun StatusRow(
+    label: String,
+    isOk: Boolean,
+    okText: String = "已连接",
+    badText: String = "未连接"
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.fillMaxWidth()
@@ -1122,7 +1214,7 @@ private fun StatusRow(label: String, isOk: Boolean) {
         )
         Spacer(modifier = Modifier.weight(1f))
         Text(
-            text = if (isOk) "已连接" else "未连接",
+            text = if (isOk) okText else badText,
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Medium,
             color = if (isOk) StatusColors.Success else StatusColors.Error
