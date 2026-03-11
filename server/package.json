@@ -1,0 +1,12 @@
+{
+  "name": "control-pairing-relay",
+  "version": "1.0.0",
+  "description": "Pairing relay server for Control app - ADB wireless pairing via browser",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

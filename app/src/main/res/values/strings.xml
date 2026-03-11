@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Control</string>
+    <string name="voice_service_channel_name">Voice Service</string>
+    <string name="voice_service_notification_title">Control is listening</string>
+    <string name="voice_service_notification_text">Voice automation is active</string>
+    <string name="settings_title">Settings</string>
+    <string name="api_key_label">API Key</string>
+    <string name="api_endpoint_label">API Endpoint</string>
+    <string name="model_label">Model</string>
+    <string name="adb_not_connected">ADB is not connected</string>
+    <string name="adb_connected">ADB is connected</string>
+    <string name="start_listening">Start Listening</string>
+    <string name="stop_listening">Stop Listening</string>
+    <string name="permission_required">Permission required</string>
+    <string name="grant_permission">Grant Permission</string>
+</resources>

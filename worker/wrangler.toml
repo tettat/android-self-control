@@ -1,0 +1,7 @@
+name = "control-pairing-relay"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+[[kv_namespaces]]
+binding = "CHANNELS"
+id = ""
