@@ -48,8 +48,8 @@ object DefaultPrompts {
 - 第2行: 4(左中) 5(正中) 6(右中)
 - 第3行: 7(左下) 8(下中) 9(右下)
 - 当控件树不可用、且目标较小时，先用 zoom_region 放大目标所在区域
-- 放大后可继续 zoom_region 进一步放大，或用 tap_region 点击区域中心
-- 大按钮可直接 tap_region，小图标建议先放大再点击
+- 放大后可继续 zoom_region 进一步放大，或用 tap_region 点击区域内目标点；默认是 center，边缘/角落目标可用 anchor=bottom/right/bottom_right 等
+- 只有当目标覆盖该区域大部分面积时，才可直接 tap_region；底部 CTA、角落按钮、边缘浮层这类目标，优先先放大或显式给 anchor
 - tap_region/zoom_region 后会自动重置缩放状态
 
 ## 应用技巧系统

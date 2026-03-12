@@ -22,13 +22,16 @@ import com.control.app.data.SettingsStore
 import com.control.app.log.ExecutionLogFormatter
 import com.control.app.prompt.DefaultPrompts
 import com.control.app.prompt.PromptManager
+import com.control.app.service.FloatingBubbleService
 import com.control.app.service.UiTreeAccessibilityService
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,6 +42,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
@@ -84,10 +88,14 @@ class AgentEngine(
         private const val TAP_SEQUENCE_MAX_INTERVAL_MS = 250
         private const val TAP_SEQUENCE_MAX_ELEMENTS = 12
         private const val TAP_SEQUENCE_SETTLE_DELAY_MS = 150L
-        private const val TAP_COORD_JITTER_PX = 6
-        private const val REGION_TAP_JITTER_PX = 8
-        private const val SWIPE_COORD_JITTER_PX = 10
-        private const val SWIPE_DURATION_JITTER_RATIO = 0.15f
+        private const val TOOL_TAP_CUE_HOLD_MS = 1_000L
+        private const val TOOL_TAP_CUE_FADE_MS = 550L
+        private const val TOOL_SWIPE_CUE_HOLD_MS = 1_050L
+        private const val TOOL_SWIPE_CUE_FADE_MS = 600L
+        private const val TOOL_SEQUENCE_CUE_HOLD_MS = 1_100L
+        private const val TOOL_SEQUENCE_CUE_FADE_MS = 650L
+        private const val SWIPE_PATH_INTERMEDIATE_POINTS = 2
+        private const val SWIPE_PATH_MAX_OFFSET_PX = 36f
         private const val MAX_TOOL_CALLS_PER_STEP = 3
         private const val UI_DUMP_FAILURES_BEFORE_COOLDOWN = 2
         private const val UI_DUMP_COOLDOWN_CAPTURES = 5
@@ -287,7 +295,10 @@ class AgentEngine(
         }
     }
 
-    suspend fun executeCommand(voiceCommand: String): String = coroutineScope {
+    suspend fun executeCommand(
+        voiceCommand: String,
+        inputTitle: String = "语音指令"
+    ): String = coroutineScope {
         val settings = settingsStore.settings.first()
 
         if (settings.apiEndpoint.isBlank()) {
@@ -335,7 +346,7 @@ class AgentEngine(
         addLog(
             DebugLogEntry(
                 type = DebugLogType.VOICE_INPUT,
-                title = "语音指令",
+                title = inputTitle,
                 content = voiceCommand
             )
         )
@@ -733,7 +744,7 @@ class AgentEngine(
                         if (zoomImageOverride != null) {
                             // zoom_region was called: send the zoomed image instead of taking a new screenshot
                             val zoomMsg = buildUserMessageWithImage(
-                                "已放大到指定区域，请查看上图。继续选择子区域放大(zoom_region)或点击(tap_region)。区域编号: 第1行123，第2行456，第3行789。",
+                                "已放大到指定区域，请查看上图。继续选择子区域放大(zoom_region)或点击(tap_region)。若目标靠边/靠角，可在 tap_region 里加 anchor=bottom/right/bottom_right 等。区域编号: 第1行123，第2行456，第3行789。",
                                 zoomImageOverride!!,
                                 detail = MODEL_IMAGE_DETAIL_ZOOM
                             )
@@ -2002,8 +2013,15 @@ class AgentEngine(
         ignoreCooldown: Boolean = false
     ): UiTreeResult? {
         captureAccessibilityUiTree()?.let { tree ->
-            uiDumpFailureStreak = 0
-            return tree
+            if (isSufficientUiTreeResult(tree)) {
+                uiDumpFailureStreak = 0
+                return tree
+            }
+            Log.w(
+                TAG,
+                "Accessibility UI tree looked incomplete, falling back to uiautomator dump " +
+                    "(elements=${tree.elementMap.size}, texts=${tree.visibleTexts.size}, lines=${tree.text.lineSequence().count { it.isNotBlank() }})"
+            )
         }
 
         if (!ignoreCooldown && uiDumpCooldownRemaining > 0) {
@@ -2041,6 +2059,13 @@ class AgentEngine(
             UiTreeAccessibilityService.captureSnapshot()
         } ?: return null
         return simplifyAccessibilityTree(snapshot)
+    }
+
+    private fun isSufficientUiTreeResult(tree: UiTreeResult): Boolean {
+        if (tree.elementMap.isNotEmpty()) return true
+
+        val nonBlankLineCount = tree.text.lineSequence().count { it.isNotBlank() }
+        return nonBlankLineCount >= 8 || tree.visibleTexts.size >= 5
     }
 
     private fun buildUiTreePlaceholderBitmap(
@@ -2173,6 +2198,58 @@ class AgentEngine(
         return jittered.coerceAtLeast(minMs)
     }
 
+    private suspend fun previewTapCue(x: Int, y: Int) {
+        FloatingBubbleService.showTapCue(
+            context = appContext,
+            x = x,
+            y = y,
+            holdMs = TOOL_TAP_CUE_HOLD_MS,
+            fadeMs = TOOL_TAP_CUE_FADE_MS
+        )
+        delay(TOOL_TAP_CUE_HOLD_MS + TOOL_TAP_CUE_FADE_MS)
+    }
+
+    private suspend fun previewSwipeCue(startX: Int, startY: Int, endX: Int, endY: Int) {
+        FloatingBubbleService.showSwipeCue(
+            context = appContext,
+            startX = startX,
+            startY = startY,
+            endX = endX,
+            endY = endY,
+            holdMs = TOOL_SWIPE_CUE_HOLD_MS,
+            fadeMs = TOOL_SWIPE_CUE_FADE_MS
+        )
+        delay(TOOL_SWIPE_CUE_HOLD_MS + TOOL_SWIPE_CUE_FADE_MS)
+    }
+
+    private suspend fun previewSequenceCue(points: List<Pair<Int, Int>>) {
+        if (points.isEmpty()) return
+        FloatingBubbleService.showSequenceCue(
+            context = appContext,
+            points = points,
+            holdMs = TOOL_SEQUENCE_CUE_HOLD_MS,
+            fadeMs = TOOL_SEQUENCE_CUE_FADE_MS
+        )
+        delay(TOOL_SEQUENCE_CUE_HOLD_MS + TOOL_SEQUENCE_CUE_FADE_MS)
+    }
+
+    private fun getScreenSizeFromCurrentCapture(): Pair<Int, Int> {
+        val scale = currentScreenshotScale.takeIf { it > 0f } ?: 1f
+        if (lastScreenshotWidth > 0 && lastScreenshotHeight > 0) {
+            return (lastScreenshotWidth / scale).roundToInt() to (lastScreenshotHeight / scale).roundToInt()
+        }
+        val metrics = appContext.resources.displayMetrics
+        return metrics.widthPixels to metrics.heightPixels
+    }
+
+    private fun buildScrollPathOnScreen(isDown: Boolean): IntArray {
+        val (screenWidth, screenHeight) = getScreenSizeFromCurrentCapture()
+        val centerX = screenWidth / 2
+        val startY = if (isDown) (screenHeight * 0.7f).roundToInt() else (screenHeight * 0.3f).roundToInt()
+        val endY = if (isDown) (screenHeight * 0.3f).roundToInt() else (screenHeight * 0.7f).roundToInt()
+        return intArrayOf(centerX, startY, centerX, endY)
+    }
+
     /**
      * Execute a single tool call from the AI. Returns a result string.
      */
@@ -2182,10 +2259,10 @@ class AgentEngine(
             "tap_element" -> {
                 val elementId = args["element"]?.jsonPrimitive?.int
                     ?: throw IllegalArgumentException("tap_element requires 'element' parameter")
-                val (origX, origY) = currentElementMap[elementId]
+                val (x, y) = currentElementMap[elementId]
                     ?: throw IllegalArgumentException("Element #$elementId not found (available: ${currentElementMap.keys.sorted()})")
-                val (x, y) = jitterScreenCoords(origX, origY, TAP_COORD_JITTER_PX)
-                Log.d(TAG, "tap_element #$elementId -> ($origX, $origY) jittered to ($x, $y)")
+                Log.d(TAG, "tap_element #$elementId -> ($x, $y)")
+                previewTapCue(x, y)
                 adbExecutor.tap(x, y).getOrThrow()
                 // Annotate screenshot with tap position
                 val scale = currentScreenshotScale
@@ -2197,7 +2274,7 @@ class AgentEngine(
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "点击位置标注",
-                        content = "tap_element #$elementId 目标坐标($origX,$origY) 实际坐标($x,$y) 截图坐标($scrX,$scrY)",
+                        content = "tap_element #$elementId 实际坐标($x,$y) 截图坐标($scrX,$scrY)",
                         imageBase64 = annotated
                     ))
                 }
@@ -2209,13 +2286,13 @@ class AgentEngine(
                     ?: throw IllegalArgumentException("input_element requires 'element' parameter")
                 val text = args["text"]?.jsonPrimitive?.content
                     ?: throw IllegalArgumentException("input_element requires 'text' parameter")
-                val (origX, origY) = currentElementMap[elementId]
+                val (x, y) = currentElementMap[elementId]
                     ?: throw IllegalArgumentException("Element #$elementId not found (available: ${currentElementMap.keys.sorted()})")
-                val (x, y) = jitterScreenCoords(origX, origY, TAP_COORD_JITTER_PX)
-                Log.d(TAG, "input_element #$elementId -> tap($origX, $origY) jittered to ($x, $y) then input '$text'")
+                Log.d(TAG, "input_element #$elementId -> tap($x, $y) then input '$text'")
+                previewTapCue(x, y)
                 adbExecutor.tap(x, y).getOrThrow()
                 delay(300)
-                adbExecutor.inputText(text).getOrThrow()
+                val inputResult = adbExecutor.inputText(text).getOrThrow()
                 // Annotate screenshot with tap position
                 val scale = currentScreenshotScale
                 lastScreenshotBase64?.let { screenshot ->
@@ -2226,11 +2303,11 @@ class AgentEngine(
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "点击位置标注",
-                        content = "input_element #$elementId 目标坐标($origX,$origY) 实际坐标($x,$y) 截图坐标($scrX,$scrY) 输入'$text'",
+                        content = "input_element #$elementId 实际坐标($x,$y) 截图坐标($scrX,$scrY) 输入'$text'",
                         imageBase64 = annotated
                     ))
                 }
-                "Tapped element #$elementId at ($x, $y) and input '$text'"
+                "Tapped element #$elementId at ($x, $y) and input '$text' [$inputResult]"
             }
 
             "tap_element_sequence" -> {
@@ -2256,19 +2333,16 @@ class AgentEngine(
                         )
                 }
 
-                val jitteredCoords = baseCoords.map { (x, y) ->
-                    jitterScreenCoords(x, y, TAP_COORD_JITTER_PX)
-                }
-
                 Log.d(TAG, "tap_element_sequence ${elements.joinToString(prefix = "[", postfix = "]")}")
-                jitteredCoords.forEachIndexed { index, (x, y) ->
+                previewSequenceCue(baseCoords)
+                baseCoords.forEachIndexed { index, (x, y) ->
                     adbExecutor.tap(x, y).getOrThrow()
-                    if (index != jitteredCoords.lastIndex && intervalMs > 0) {
+                    if (index != baseCoords.lastIndex && intervalMs > 0) {
                         delay(intervalMs.toLong())
                     }
                 }
                 lastScreenshotBase64?.let { screenshot ->
-                    val screenshotPoints = jitteredCoords.map { (x, y) -> mapScreenPointToScreenshot(x, y) }
+                    val screenshotPoints = baseCoords.map { (x, y) -> mapScreenPointToScreenshot(x, y) }
                     val annotated = annotateScreenshotWithSequence(
                         imageBase64 = screenshot,
                         points = screenshotPoints,
@@ -2279,7 +2353,7 @@ class AgentEngine(
                         title = "连续点击路径标注",
                         content = buildString {
                             appendLine("elements=${elements.joinToString(prefix = "[", postfix = "]")}")
-                            append("实际坐标=${jitteredCoords.joinToString(prefix = "[", postfix = "]") { "(${it.first},${it.second})" }}")
+                            append("实际坐标=${baseCoords.joinToString(prefix = "[", postfix = "]") { "(${it.first},${it.second})" }}")
                         },
                         imageBase64 = annotated
                     ))
@@ -2294,20 +2368,19 @@ class AgentEngine(
                 val rawY = args["y"]?.jsonPrimitive?.int
                     ?: throw IllegalArgumentException("tap requires 'y' parameter")
                 val scale = currentScreenshotScale
-                val baseX = if (scale > 0f && scale < 1f) (rawX / scale).toInt() else rawX
-                val baseY = if (scale > 0f && scale < 1f) (rawY / scale).toInt() else rawY
-                val (x, y) = jitterScreenCoords(baseX, baseY, TAP_COORD_JITTER_PX)
-                Log.d(TAG, "tap: AI coords ($rawX, $rawY) -> base screen coords ($baseX, $baseY) jittered to ($x, $y) [scale=$scale]")
+                val x = if (scale > 0f && scale < 1f) (rawX / scale).toInt() else rawX
+                val y = if (scale > 0f && scale < 1f) (rawY / scale).toInt() else rawY
+                Log.d(TAG, "tap: AI coords ($rawX, $rawY) -> screen coords ($x, $y) [scale=$scale]")
+                previewTapCue(x, y)
                 adbExecutor.tap(x, y).getOrThrow()
                 // Annotate screenshot with tap position
                 lastScreenshotBase64?.let { screenshot ->
-                    val (scrX, scrY) = mapScreenPointToScreenshot(x, y)
-                    val label = "tap ($rawX,$rawY)->($scrX,$scrY)"
-                    val annotated = annotateScreenshotWithTap(screenshot, scrX, scrY, label)
+                    val label = "tap ($rawX,$rawY)->($x,$y)"
+                    val annotated = annotateScreenshotWithTap(screenshot, rawX, rawY, label)
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "点击位置标注",
-                        content = "tap 截图目标坐标($rawX,$rawY) 实际屏幕坐标($x,$y) 实际截图坐标($scrX,$scrY)",
+                        content = "tap 截图坐标($rawX,$rawY) 实际坐标($x,$y)",
                         imageBase64 = annotated
                     ))
                 }
@@ -2325,32 +2398,29 @@ class AgentEngine(
                     ?: throw IllegalArgumentException("swipe requires 'endY'")
                 val duration = args["duration"]?.jsonPrimitive?.intOrNull ?: 300
                 val scale = currentScreenshotScale
-                val baseSx = if (scale > 0f && scale < 1f) (rawSx / scale).toInt() else rawSx
-                val baseSy = if (scale > 0f && scale < 1f) (rawSy / scale).toInt() else rawSy
-                val baseEx = if (scale > 0f && scale < 1f) (rawEx / scale).toInt() else rawEx
-                val baseEy = if (scale > 0f && scale < 1f) (rawEy / scale).toInt() else rawEy
-                val (sx, sy) = jitterScreenCoords(baseSx, baseSy, SWIPE_COORD_JITTER_PX)
-                val (ex, ey) = jitterScreenCoords(baseEx, baseEy, SWIPE_COORD_JITTER_PX)
-                val jitteredDuration = jitterDurationMs(duration, SWIPE_DURATION_JITTER_RATIO)
-                adbExecutor.swipe(sx, sy, ex, ey, jitteredDuration).getOrThrow()
+                val sx = if (scale > 0f && scale < 1f) (rawSx / scale).toInt() else rawSx
+                val sy = if (scale > 0f && scale < 1f) (rawSy / scale).toInt() else rawSy
+                val ex = if (scale > 0f && scale < 1f) (rawEx / scale).toInt() else rawEx
+                val ey = if (scale > 0f && scale < 1f) (rawEy / scale).toInt() else rawEy
+                val swipePath = buildSwipePath(sx, sy, ex, ey)
+                previewSwipeCue(sx, sy, ex, ey)
+                adbExecutor.swipePath(swipePath, duration).getOrThrow()
                 lastScreenshotBase64?.let { screenshot ->
+                    val screenshotPath = swipePath.map { (px, py) -> mapScreenPointToScreenshot(px, py) }
                     val label = "swipe ($rawSx,$rawSy)->($rawEx,$rawEy)"
                     val annotated = annotateScreenshotWithSwipe(
                         imageBase64 = screenshot,
-                        startX = rawSx,
-                        startY = rawSy,
-                        endX = rawEx,
-                        endY = rawEy,
+                        pathPoints = screenshotPath,
                         label = label
                     )
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "滑动路径标注",
-                        content = "swipe 截图起点($rawSx,$rawSy) 终点($rawEx,$rawEy) 实际起点($sx,$sy) 终点($ex,$ey) 时长${jitteredDuration}ms",
+                        content = "swipe 截图起点($rawSx,$rawSy) 终点($rawEx,$rawEy) 实际起点($sx,$sy) 终点($ex,$ey) 时长${duration}ms",
                         imageBase64 = annotated
                     ))
                 }
-                "Swiped from ($sx,$sy) to ($ex,$ey) in ${jitteredDuration}ms"
+                "Swiped from ($sx,$sy) to ($ex,$ey) in ${duration}ms"
             }
 
             "launch_app" -> {
@@ -2371,6 +2441,8 @@ class AgentEngine(
             }
 
             "scroll_down" -> {
+                val (previewStartX, previewStartY, previewEndX, previewEndY) = buildScrollPathOnScreen(isDown = true)
+                previewSwipeCue(previewStartX, previewStartY, previewEndX, previewEndY)
                 adbExecutor.scrollDown().getOrThrow()
                 lastScreenshotBase64?.let { screenshot ->
                     val (sx, sy, ex, ey) = buildViewportScrollPath(isDown = true, screenshot)
@@ -2393,6 +2465,8 @@ class AgentEngine(
             }
 
             "scroll_up" -> {
+                val (previewStartX, previewStartY, previewEndX, previewEndY) = buildScrollPathOnScreen(isDown = false)
+                previewSwipeCue(previewStartX, previewStartY, previewEndX, previewEndY)
                 adbExecutor.scrollUp().getOrThrow()
                 lastScreenshotBase64?.let { screenshot ->
                     val (sx, sy, ex, ey) = buildViewportScrollPath(isDown = false, screenshot)
@@ -2417,8 +2491,8 @@ class AgentEngine(
             "input_text" -> {
                 val text = args["text"]?.jsonPrimitive?.content
                     ?: throw IllegalArgumentException("input_text requires 'text'")
-                adbExecutor.inputText(text).getOrThrow()
-                "Input text: '$text'"
+                val inputResult = adbExecutor.inputText(text).getOrThrow()
+                "Input text: '$text' [$inputResult]"
             }
 
             "key_event" -> {
@@ -2488,35 +2562,41 @@ class AgentEngine(
                     imageBase64 = gridImage
                 ))
 
-                "已放大区域 $region，当前视口: (${newLeft.toInt()},${newTop.toInt()})-(${(newLeft+cellW).toInt()},${(newTop+cellH).toInt()})。请查看放大后的截图，选择子区域继续放大或点击。"
+                "已放大区域 $region，当前视口: (${newLeft.toInt()},${newTop.toInt()})-(${(newLeft+cellW).toInt()},${(newTop+cellH).toInt()})。请查看放大后的截图，选择子区域继续放大或点击；若目标靠边/靠角，可在 tap_region 里加 anchor。"
             }
 
             "tap_region" -> {
                 val region = args["region"]?.jsonPrimitive?.int
                     ?: throw IllegalArgumentException("tap_region requires 'region' parameter")
                 if (region !in 1..9) throw IllegalArgumentException("region must be 1-9, got $region")
+                val anchor = RegionTapResolver.resolveAnchor(
+                    explicitAnchor = args["anchor"]?.jsonPrimitive?.contentOrNull,
+                    description = args["description"]?.jsonPrimitive?.contentOrNull
+                )
 
-                val (baseX, baseY) = getZoneCenterCoords(region)
-                val (x, y) = jitterScreenCoords(baseX, baseY, REGION_TAP_JITTER_PX)
-                Log.d(TAG, "tap_region $region -> base ($baseX, $baseY) jittered to ($x, $y), zoomRect=$currentZoomRect")
+                val (x, y) = getZoneTapCoords(region, anchor)
+                Log.d(TAG, "tap_region $region anchor=${anchor.apiName} -> ($x, $y), zoomRect=$currentZoomRect")
 
+                previewTapCue(x, y)
                 adbExecutor.tap(x, y).getOrThrow()
 
                 // Annotate
                 lastScreenshotBase64?.let { screenshot ->
-                    val label = "tap_region $region ($x,$y)"
+                    val label = "tap_region $region/${anchor.apiName} ($x,$y)"
                     val bytes = Base64.decode(screenshot, Base64.NO_WRAP)
                     val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    val scrCol = (region - 1) % 3
-                    val scrRow = (region - 1) / 3
-                    val scrX = (bmp.width / 3 * scrCol + bmp.width / 6)
-                    val scrY = (bmp.height / 3 * scrRow + bmp.height / 6)
+                    val (scrX, scrY) = RegionTapResolver.calculateTapPoint(
+                        zone = region,
+                        viewportWidth = bmp.width.toFloat(),
+                        viewportHeight = bmp.height.toFloat(),
+                        anchor = anchor
+                    )
                     bmp.recycle()
                     val annotated = annotateScreenshotWithTap(screenshot, scrX, scrY, label)
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "点击区域 $region",
-                        content = "tap_region $region 实际屏幕坐标($x,$y)",
+                        content = "tap_region $region anchor=${anchor.apiName} 实际屏幕坐标($x,$y)",
                         imageBase64 = annotated
                     ))
                 }
@@ -2524,7 +2604,7 @@ class AgentEngine(
                 // Reset zoom state after tap
                 currentZoomRect = null
 
-                "Tapped region $region at screen coordinates ($x, $y)"
+                "Tapped region $region at screen coordinates ($x, $y) [anchor=${anchor.apiName}]"
             }
 
             "wait" -> {
@@ -2653,6 +2733,24 @@ class AgentEngine(
         }
     }
 
+    @Synchronized
+    fun submitCommand(
+        command: String,
+        scope: CoroutineScope,
+        inputTitle: String = "语音指令"
+    ): Boolean {
+        val normalizedCommand = command.trim()
+        if (normalizedCommand.isBlank()) return false
+        if (currentJob?.isActive == true || _agentState.value.isRunning) return false
+
+        val job = scope.launch {
+            executeCommand(normalizedCommand, inputTitle)
+        }
+        setCurrentJob(job)
+        return true
+    }
+
+    @Synchronized
     fun cancel() {
         currentJob?.cancel()
         currentJob = null
@@ -2669,8 +2767,16 @@ class AgentEngine(
         }
     }
 
+    @Synchronized
     fun setCurrentJob(job: Job) {
         currentJob = job
+        job.invokeOnCompletion {
+            synchronized(this) {
+                if (currentJob === job) {
+                    currentJob = null
+                }
+            }
+        }
     }
 
     private fun resetCaptureStateForNewTask() {
@@ -2858,6 +2964,29 @@ class AgentEngine(
         return result
     }
 
+    private fun buildSwipePath(
+        startX: Int,
+        startY: Int,
+        endX: Int,
+        endY: Int,
+        pointCount: Int = 6
+    ): List<Pair<Int, Int>> {
+        val safePointCount = pointCount.coerceAtLeast(2)
+        val points = (0 until safePointCount).map { index ->
+            val progress = index.toFloat() / (safePointCount - 1).toFloat()
+            Pair(
+                (startX + (endX - startX) * progress).roundToInt(),
+                (startY + (endY - startY) * progress).roundToInt()
+            )
+        }.distinct()
+
+        return if (points.size >= 2) {
+            points
+        } else {
+            listOf(startX to startY, endX to endY)
+        }
+    }
+
     private fun annotateScreenshotWithSwipe(
         imageBase64: String,
         startX: Int,
@@ -2865,7 +2994,21 @@ class AgentEngine(
         endX: Int,
         endY: Int,
         label: String
+    ): String = annotateScreenshotWithSwipe(
+        imageBase64 = imageBase64,
+        pathPoints = listOf(startX to startY, endX to endY),
+        label = label
+    )
+
+    private fun annotateScreenshotWithSwipe(
+        imageBase64: String,
+        pathPoints: List<Pair<Int, Int>>,
+        label: String
     ): String {
+        require(pathPoints.size >= 2) { "annotateScreenshotWithSwipe requires at least 2 points" }
+
+        val (startX, startY) = pathPoints.first()
+        val (endX, endY) = pathPoints.last()
         val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
         val original = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
@@ -2880,9 +3023,21 @@ class AgentEngine(
             strokeCap = Paint.Cap.ROUND
             strokeJoin = Paint.Join.ROUND
         }
-        canvas.drawLine(startX.toFloat(), startY.toFloat(), endX.toFloat(), endY.toFloat(), pathPaint)
+        pathPoints.zipWithNext().forEach { (start, end) ->
+            canvas.drawLine(
+                start.first.toFloat(),
+                start.second.toFloat(),
+                end.first.toFloat(),
+                end.second.toFloat(),
+                pathPaint
+            )
+        }
 
-        val angle = atan2((endY - startY).toFloat(), (endX - startX).toFloat())
+        val penultimate = pathPoints[pathPoints.lastIndex - 1]
+        val angle = atan2(
+            (endY - penultimate.second).toFloat(),
+            (endX - penultimate.first).toFloat()
+        )
         val arrowLength = 30f
         val arrowSpread = 0.55f
         val arrowX1 = endX - arrowLength * cos(angle - arrowSpread)
@@ -3152,10 +3307,13 @@ class AgentEngine(
     }
 
     /**
-     * Calculate the center point of a zone (1-9) within the current zoom viewport.
+     * Calculate the tap point of a zone (1-9) within the current zoom viewport.
      * Returns (x, y) in REAL screen coordinates suitable for adbExecutor.tap().
      */
-    private fun getZoneCenterCoords(zone: Int): Pair<Int, Int> {
+    private fun getZoneTapCoords(
+        zone: Int,
+        anchor: RegionAnchor = RegionAnchor.CENTER
+    ): Pair<Int, Int> {
         val rect = currentZoomRect
         val screenWidth: Float
         val screenHeight: Float
@@ -3183,14 +3341,14 @@ class AgentEngine(
             offsetY = 0f
         }
 
-        val col = (zone - 1) % 3
-        val row = (zone - 1) / 3
-        val cellW = screenWidth / 3f
-        val cellH = screenHeight / 3f
-        val centerX = (offsetX + cellW * col + cellW / 2f).toInt()
-        val centerY = (offsetY + cellH * row + cellH / 2f).toInt()
-
-        return Pair(centerX, centerY)
+        return RegionTapResolver.calculateTapPoint(
+            zone = zone,
+            viewportWidth = screenWidth,
+            viewportHeight = screenHeight,
+            offsetX = offsetX,
+            offsetY = offsetY,
+            anchor = anchor
+        )
     }
 
     private fun bitmapToBase64(

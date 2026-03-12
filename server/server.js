@@ -173,6 +173,69 @@ const logsHtml = `<!DOCTYPE html>
     display: grid;
     gap: 12px;
   }
+  .control-panel {
+    margin-top: 16px;
+    padding: 16px;
+    border-radius: 16px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(144, 202, 249, 0.12);
+  }
+  .control-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px 12px;
+    margin-bottom: 10px;
+  }
+  .control-row {
+    display: flex;
+    gap: 10px;
+    align-items: stretch;
+  }
+  .control-row textarea {
+    flex: 1;
+    min-height: 84px;
+    resize: vertical;
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 12px;
+    background: rgba(10, 18, 24, 0.92);
+    color: #e8eef3;
+    padding: 12px 14px;
+    font: inherit;
+  }
+  .control-row textarea:focus {
+    outline: 2px solid rgba(66,165,245,0.22);
+    border-color: rgba(66,165,245,0.45);
+  }
+  .control-button {
+    min-width: 120px;
+    padding: 0 18px;
+    border: none;
+    border-radius: 12px;
+    background: #1e88e5;
+    color: #fff;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .control-button.stop {
+    background: #e65132;
+  }
+  .control-button:disabled {
+    background: #37474f;
+    color: #90a4ae;
+    cursor: not-allowed;
+  }
+  .control-feedback {
+    min-height: 20px;
+    margin-top: 8px;
+  }
+  .control-feedback.success {
+    color: #81c784;
+  }
+  .control-feedback.error {
+    color: #ef9a9a;
+  }
   .entry {
     padding: 14px;
   }
@@ -226,6 +289,8 @@ const logsHtml = `<!DOCTYPE html>
   a { color: #90caf9; }
   @media (max-width: 900px) {
     .grid { grid-template-columns: 1fr; }
+    .control-row { flex-direction: column; }
+    .control-button { min-height: 48px; width: 100%; }
   }
 </style>
 </head>
@@ -248,6 +313,18 @@ const logsHtml = `<!DOCTYPE html>
 
     <section class="panel">
       <div id="summary" class="meta">正在加载...</div>
+      <div class="control-panel">
+        <div class="control-head">
+          <strong>手动输入指令</strong>
+          <span class="meta">这里提交的文本会按语音指令同样的流程交给 Agent。</span>
+        </div>
+        <div class="control-row">
+          <textarea id="commandInput" placeholder="例如：打开微信，给张三发消息说我十分钟后到"></textarea>
+          <button id="commandButton" class="control-button" type="button" onclick="handleCommandButton()">发送指令</button>
+        </div>
+        <div id="commandFeedback" class="meta control-feedback"></div>
+        <div id="controlHint" class="meta"></div>
+      </div>
       <div id="entries" class="entries" style="margin-top: 16px;"></div>
     </section>
   </div>
@@ -257,7 +334,14 @@ const logsHtml = `<!DOCTYPE html>
 const AUTO_REFRESH_KEY = 'control-logs-autoRefresh';
 const REFRESH_INTERVAL_MS = 5000;
 
-const state = { selectedId: null, timer: null, autoRefresh: true };
+const state = {
+  selectedId: null,
+  timer: null,
+  autoRefresh: true,
+  selectedSnapshot: null,
+  controlBaseUrl: '',
+  commandInFlight: false,
+};
 
 function getStoredAutoRefresh() {
   try {
@@ -295,6 +379,60 @@ function escapeHtml(value) {
     .replaceAll("'", '&#39;');
 }
 
+function normalizeBaseUrl(url) {
+  return String(url || '').replace(/\\/+$/, '');
+}
+
+function setFeedback(message, tone) {
+  const el = document.getElementById('commandFeedback');
+  el.textContent = message || '';
+  el.className = 'meta control-feedback' + (tone ? ' ' + tone : '');
+}
+
+function getControlAvailability() {
+  if (!state.selectedSnapshot) {
+    return { ok: false, reason: '选择设备后即可在这里发送指令。' };
+  }
+  if (!state.controlBaseUrl) {
+    return { ok: false, reason: '当前设备没有可用的手机日志地址。' };
+  }
+  if (window.location.protocol === 'https:' && state.controlBaseUrl.startsWith('http://')) {
+    return {
+      ok: false,
+      reason: '当前页面使用 HTTPS，浏览器通常会拦截对手机 http 地址的控制请求。请打开手机日志地址操作。'
+    };
+  }
+  return { ok: true, reason: '' };
+}
+
+function updateControlUi() {
+  const snapshot = state.selectedSnapshot || {};
+  const stateInfo = snapshot.agentState || {};
+  const isRunning = !!stateInfo.isRunning;
+  const available = getControlAvailability();
+  const button = document.getElementById('commandButton');
+  button.textContent = isRunning ? '停止运行' : '发送指令';
+  button.classList.toggle('stop', isRunning);
+  button.disabled = state.commandInFlight || !available.ok;
+
+  let hintHtml = available.reason ? escapeHtml(available.reason) : '控制通道可用';
+  if (state.controlBaseUrl) {
+    const link = '<a href="' + escapeHtml(state.controlBaseUrl) + '" target="_blank" rel="noreferrer">打开手机日志页</a>';
+    hintHtml = available.ok ? ('控制通道: ' + link) : (hintHtml + ' · ' + link);
+  }
+  document.getElementById('controlHint').innerHTML = hintHtml;
+}
+
+function applyOptimisticAgentState(isRunning, statusMessage) {
+  if (!state.selectedSnapshot) return;
+  const stateInfo = state.selectedSnapshot.agentState || {};
+  state.selectedSnapshot.agentState = Object.assign({}, stateInfo, {
+    isRunning,
+    statusMessage: statusMessage || stateInfo.statusMessage || '',
+  });
+  renderDevice(state.selectedSnapshot);
+}
+
 async function loadDevices() {
   const res = await fetch('/api/device-logs');
   const data = await res.json();
@@ -308,6 +446,9 @@ async function loadDevices() {
   } else {
     document.getElementById('summary').textContent = '暂无设备日志';
     document.getElementById('entries').innerHTML = '';
+    state.selectedSnapshot = null;
+    state.controlBaseUrl = '';
+    updateControlUi();
   }
 }
 
@@ -332,6 +473,9 @@ async function loadDevice(deviceId) {
   if (!res.ok) {
     document.getElementById('summary').textContent = '设备日志不存在或已过期';
     document.getElementById('entries').innerHTML = '';
+    state.selectedSnapshot = null;
+    state.controlBaseUrl = '';
+    updateControlUi();
     return;
   }
   const snapshot = await res.json();
@@ -339,15 +483,18 @@ async function loadDevice(deviceId) {
 }
 
 function renderDevice(snapshot) {
+  state.selectedSnapshot = snapshot;
+  state.controlBaseUrl = normalizeBaseUrl(((snapshot.logServer && snapshot.logServer.accessUrls) || [])[0] || '');
   const stateInfo = snapshot.agentState || {};
   const urls = ((snapshot.logServer && snapshot.logServer.accessUrls) || [])
-    .map(url => '<a href="' + escapeHtml(url) + '">' + escapeHtml(url) + '</a>')
+    .map(url => '<a href="' + escapeHtml(url) + '" target="_blank" rel="noreferrer">' + escapeHtml(url) + '</a>')
     .join(' , ');
   document.getElementById('summary').innerHTML =
     '<div><strong>' + escapeHtml(snapshot.deviceName || snapshot.deviceId || '未知设备') + '</strong></div>' +
     '<div class="meta">状态: ' + escapeHtml(stateInfo.statusMessage || '无') + '</div>' +
     '<div class="meta">最后同步: ' + escapeHtml(snapshot.relaySyncedAtFormatted || snapshot.exportTime || '') + '</div>' +
     '<div class="meta">手机日志地址: ' + (urls || '无') + '</div>';
+  updateControlUi();
 
   const entries = snapshot.entries || [];
   document.getElementById('entries').innerHTML = entries.slice().reverse().map(entry => (
@@ -364,8 +511,81 @@ async function selectDevice(deviceId) {
   await loadDevices();
 }
 
+async function handleCommandButton() {
+  if (!state.selectedSnapshot) {
+    setFeedback('请先选择设备。', 'error');
+    return;
+  }
+
+  const availability = getControlAvailability();
+  if (!availability.ok) {
+    setFeedback(availability.reason, 'error');
+    updateControlUi();
+    return;
+  }
+
+  const stateInfo = state.selectedSnapshot.agentState || {};
+  const isRunning = !!stateInfo.isRunning;
+  const input = document.getElementById('commandInput');
+  const command = input.value.trim();
+
+  if (!isRunning && !command) {
+    setFeedback('请输入要执行的指令。', 'error');
+    return;
+  }
+
+  state.commandInFlight = true;
+  updateControlUi();
+
+  try {
+    if (isRunning) {
+      const response = await fetch(state.controlBaseUrl + '/api/agent/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || ('HTTP ' + response.status));
+      }
+      setFeedback(data.message || '已请求停止当前任务。', 'success');
+      applyOptimisticAgentState(false, data.message || '已请求停止');
+    } else {
+      const response = await fetch(state.controlBaseUrl + '/api/agent/command', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ command }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || ('HTTP ' + response.status));
+      }
+      input.value = '';
+      setFeedback(data.message || '指令已发送。', 'success');
+      applyOptimisticAgentState(true, data.message || '正在启动手动指令...');
+    }
+    await loadDevice(state.selectedId);
+    window.setTimeout(function() {
+      loadDevice(state.selectedId);
+    }, 1200);
+  } catch (error) {
+    setFeedback(error.message || '操作失败', 'error');
+    await loadDevice(state.selectedId);
+  } finally {
+    state.commandInFlight = false;
+    updateControlUi();
+  }
+}
+
+document.getElementById('commandInput').addEventListener('keydown', function(event) {
+  if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+    event.preventDefault();
+    handleCommandButton();
+  }
+});
+
 state.autoRefresh = getStoredAutoRefresh();
 applyAutoRefresh(state.autoRefresh);
+updateControlUi();
 loadDevices();
 </script>
 </body>

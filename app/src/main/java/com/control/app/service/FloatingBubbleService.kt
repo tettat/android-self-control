@@ -66,7 +66,19 @@ class FloatingBubbleService : Service() {
         private const val ACTION_BTN_SIZE_DP = 44
         private const val MARGIN_DP = 8
         private const val ACTION_PREVIEW_GLOW = "com.control.app.action.PREVIEW_GLOW"
+        private const val ACTION_SHOW_TAP_CUE = "com.control.app.action.SHOW_TAP_CUE"
+        private const val ACTION_SHOW_SWIPE_CUE = "com.control.app.action.SHOW_SWIPE_CUE"
+        private const val ACTION_SHOW_SEQUENCE_CUE = "com.control.app.action.SHOW_SEQUENCE_CUE"
         private const val EXTRA_PREVIEW_DURATION_MS = "preview_duration_ms"
+        private const val EXTRA_HOLD_DURATION_MS = "hold_duration_ms"
+        private const val EXTRA_FADE_DURATION_MS = "fade_duration_ms"
+        private const val EXTRA_X = "x"
+        private const val EXTRA_Y = "y"
+        private const val EXTRA_START_X = "start_x"
+        private const val EXTRA_START_Y = "start_y"
+        private const val EXTRA_END_X = "end_x"
+        private const val EXTRA_END_Y = "end_y"
+        private const val EXTRA_POINTS = "points"
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
@@ -89,6 +101,77 @@ class FloatingBubbleService : Service() {
                 action = ACTION_PREVIEW_GLOW
                 putExtra(EXTRA_PREVIEW_DURATION_MS, durationMs)
             }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
+        fun showTapCue(
+            context: Context,
+            x: Int,
+            y: Int,
+            holdMs: Long,
+            fadeMs: Long
+        ) {
+            startCueService(
+                context,
+                Intent(context, FloatingBubbleService::class.java).apply {
+                    action = ACTION_SHOW_TAP_CUE
+                    putExtra(EXTRA_X, x)
+                    putExtra(EXTRA_Y, y)
+                    putExtra(EXTRA_HOLD_DURATION_MS, holdMs)
+                    putExtra(EXTRA_FADE_DURATION_MS, fadeMs)
+                }
+            )
+        }
+
+        fun showSwipeCue(
+            context: Context,
+            startX: Int,
+            startY: Int,
+            endX: Int,
+            endY: Int,
+            holdMs: Long,
+            fadeMs: Long
+        ) {
+            startCueService(
+                context,
+                Intent(context, FloatingBubbleService::class.java).apply {
+                    action = ACTION_SHOW_SWIPE_CUE
+                    putExtra(EXTRA_START_X, startX)
+                    putExtra(EXTRA_START_Y, startY)
+                    putExtra(EXTRA_END_X, endX)
+                    putExtra(EXTRA_END_Y, endY)
+                    putExtra(EXTRA_HOLD_DURATION_MS, holdMs)
+                    putExtra(EXTRA_FADE_DURATION_MS, fadeMs)
+                }
+            )
+        }
+
+        fun showSequenceCue(
+            context: Context,
+            points: List<Pair<Int, Int>>,
+            holdMs: Long,
+            fadeMs: Long
+        ) {
+            if (points.isEmpty()) return
+            startCueService(
+                context,
+                Intent(context, FloatingBubbleService::class.java).apply {
+                    action = ACTION_SHOW_SEQUENCE_CUE
+                    putExtra(
+                        EXTRA_POINTS,
+                        points.joinToString(";") { "${it.first},${it.second}" }
+                    )
+                    putExtra(EXTRA_HOLD_DURATION_MS, holdMs)
+                    putExtra(EXTRA_FADE_DURATION_MS, fadeMs)
+                }
+            )
+        }
+
+        private fun startCueService(context: Context, intent: Intent) {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
             } else {
@@ -128,6 +211,7 @@ class FloatingBubbleService : Service() {
     private lateinit var menuParams: WindowManager.LayoutParams
 
     private var edgeGlowOverlay: AutomationEdgeGlowView? = null
+    private var gestureCueOverlay: GestureCueOverlayView? = null
     private var overlayPanel: TextView? = null
     private var overlayPanelParams: WindowManager.LayoutParams? = null
     private var showOverlaySetting = true
@@ -156,6 +240,7 @@ class FloatingBubbleService : Service() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         createNotificationChannel()
         createEdgeGlowOverlay()
+        createGestureCueOverlay()
         createBubble()
         createMenu()
         createOverlayPanel()
@@ -185,6 +270,7 @@ class FloatingBubbleService : Service() {
         try { windowManager.removeView(bubbleView) } catch (_: Exception) {}
         try { windowManager.removeView(menuContainer) } catch (_: Exception) {}
         try { edgeGlowOverlay?.let { windowManager.removeView(it) } } catch (_: Exception) {}
+        try { gestureCueOverlay?.let { windowManager.removeView(it) } } catch (_: Exception) {}
         try { overlayPanel?.let { windowManager.removeView(it) } } catch (_: Exception) {}
         super.onDestroy()
     }
@@ -399,6 +485,34 @@ class FloatingBubbleService : Service() {
         windowManager.addView(overlayPanel, overlayPanelParams)
     }
 
+    private fun createGestureCueOverlay() {
+        gestureCueOverlay = GestureCueOverlayView(this).apply {
+            visibility = View.GONE
+            isClickable = false
+            isFocusable = false
+        }
+
+        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            overlayType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+        }
+
+        windowManager.addView(gestureCueOverlay, params)
+    }
+
     private fun shouldShowAutomationCue(): Boolean {
         return isGlowPreviewActive || (isAgentRunning && showOverlaySetting)
     }
@@ -469,6 +583,47 @@ class FloatingBubbleService : Service() {
             ACTION_PREVIEW_GLOW -> {
                 val durationMs = intent.getLongExtra(EXTRA_PREVIEW_DURATION_MS, GLOW_PREVIEW_DURATION_MS)
                 startGlowPreview(durationMs.coerceAtLeast(1_000L))
+            }
+            ACTION_SHOW_TAP_CUE -> {
+                val x = intent.getIntExtra(EXTRA_X, -1)
+                val y = intent.getIntExtra(EXTRA_Y, -1)
+                if (x >= 0 && y >= 0) {
+                    gestureCueOverlay?.showTapCue(
+                        x = x.toFloat(),
+                        y = y.toFloat(),
+                        holdMs = intent.getLongExtra(EXTRA_HOLD_DURATION_MS, 1_000L),
+                        fadeMs = intent.getLongExtra(EXTRA_FADE_DURATION_MS, 550L)
+                    )
+                }
+            }
+            ACTION_SHOW_SWIPE_CUE -> {
+                gestureCueOverlay?.showSwipeCue(
+                    startX = intent.getIntExtra(EXTRA_START_X, 0).toFloat(),
+                    startY = intent.getIntExtra(EXTRA_START_Y, 0).toFloat(),
+                    endX = intent.getIntExtra(EXTRA_END_X, 0).toFloat(),
+                    endY = intent.getIntExtra(EXTRA_END_Y, 0).toFloat(),
+                    holdMs = intent.getLongExtra(EXTRA_HOLD_DURATION_MS, 1_000L),
+                    fadeMs = intent.getLongExtra(EXTRA_FADE_DURATION_MS, 550L)
+                )
+            }
+            ACTION_SHOW_SEQUENCE_CUE -> {
+                val points = intent.getStringExtra(EXTRA_POINTS)
+                    ?.split(';')
+                    ?.mapNotNull { token ->
+                        val coords = token.split(',')
+                        if (coords.size != 2) return@mapNotNull null
+                        val x = coords[0].toFloatOrNull() ?: return@mapNotNull null
+                        val y = coords[1].toFloatOrNull() ?: return@mapNotNull null
+                        x to y
+                    }
+                    .orEmpty()
+                if (points.isNotEmpty()) {
+                    gestureCueOverlay?.showSequenceCue(
+                        points = points,
+                        holdMs = intent.getLongExtra(EXTRA_HOLD_DURATION_MS, 1_050L),
+                        fadeMs = intent.getLongExtra(EXTRA_FADE_DURATION_MS, 600L)
+                    )
+                }
             }
         }
     }
@@ -630,10 +785,7 @@ class FloatingBubbleService : Service() {
 
     private fun executeVoiceCommand(command: String) {
         Log.d(TAG, "Voice command: $command")
-        serviceScope.launch {
-            val job = launch { app.agentEngine.executeCommand(command) }
-            app.agentEngine.setCurrentJob(job)
-        }
+        app.agentEngine.submitCommand(command = command, scope = serviceScope)
     }
 
     // ======================== Agent State Observer ========================

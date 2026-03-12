@@ -14,6 +14,7 @@ import java.io.ByteArrayOutputStream
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
+import kotlin.math.roundToInt
 
 /**
  * Replacement for ShizukuExecutor. Uses libadb-android to connect to the device's
@@ -37,6 +38,8 @@ class AdbExecutor(private val context: Context) {
         private const val SCREENSHOT_RETRY_DELAY_MS = 400L
         private const val UI_DUMP_COMMAND_TIMEOUT_MS = 7_000L
         private const val UI_DUMP_READ_TIMEOUT_MS = 5_000L
+        private const val ACCESSIBILITY_INPUT_RETRY_COUNT = 4
+        private const val ACCESSIBILITY_INPUT_RETRY_DELAY_MS = 120L
     }
 
     private val connectionManager: AdbConnectionManagerImpl by lazy {
@@ -367,6 +370,33 @@ class AdbExecutor(private val context: Context) {
         return executeCommand("input swipe $startX $startY $endX $endY $duration")
     }
 
+    suspend fun swipePath(
+        points: List<Pair<Int, Int>>,
+        duration: Int = 300
+    ): Result<String> = withContext(Dispatchers.IO) {
+        runCatching {
+            require(points.size >= 2) { "swipePath requires at least 2 points" }
+            val totalDuration = duration.coerceAtLeast(40)
+            val moveCount = points.size - 1
+            val segmentDelayMs = (totalDuration.toFloat() / moveCount).roundToInt().coerceAtLeast(5)
+            val command = buildString {
+                append("sh -c '")
+                append("input motionevent DOWN ${points.first().first} ${points.first().second}")
+                for (point in points.drop(1)) {
+                    append("; sleep ")
+                    append(formatSleepSeconds(segmentDelayMs))
+                    append("; input motionevent MOVE ${point.first} ${point.second}")
+                }
+                append("; sleep ")
+                append(formatSleepSeconds(segmentDelayMs))
+                append("; input motionevent UP ${points.last().first} ${points.last().second}")
+                append("'")
+            }
+            Log.d(TAG, "Swipe path with ${points.size} points duration=$duration")
+            executeCommand(command, timeoutMs = (DEFAULT_SHELL_TIMEOUT_MS + totalDuration).coerceAtLeast(2_000L)).getOrThrow()
+        }
+    }
+
     suspend fun inputText(text: String): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
             Log.d(TAG, "Input text: ${text.take(50)}")
@@ -456,12 +486,33 @@ class AdbExecutor(private val context: Context) {
         )
     }
 
-    private suspend fun inputTextViaAccessibility(text: String): String =
-        withContext(Dispatchers.Main) {
-            UiTreeAccessibilityService.setTextOnFocusedInput(text).getOrThrow()
+    private suspend fun inputTextViaAccessibility(text: String): String {
+        var lastFailure: Throwable? = null
+        repeat(ACCESSIBILITY_INPUT_RETRY_COUNT) { attempt ->
+            val result = withContext(Dispatchers.Main) {
+                UiTreeAccessibilityService.setTextOnFocusedInput(text)
+            }
+            if (result.isSuccess) {
+                return result.getOrThrow()
+            }
+
+            lastFailure = result.exceptionOrNull()
+            if (attempt < ACCESSIBILITY_INPUT_RETRY_COUNT - 1) {
+                delay(ACCESSIBILITY_INPUT_RETRY_DELAY_MS)
+            }
         }
 
+        throw RuntimeException(
+            "Accessibility text injection could not find a ready editable input",
+            lastFailure
+        )
+    }
+
     private fun shellSingleQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
+
+    private fun formatSleepSeconds(durationMs: Int): String {
+        return String.format(java.util.Locale.US, "%.3f", durationMs / 1000f)
+    }
 
     private fun escapeAsciiInputText(text: String): String = text
         .replace("\\", "\\\\")

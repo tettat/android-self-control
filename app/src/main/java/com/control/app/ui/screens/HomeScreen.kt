@@ -238,10 +238,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun executeCommand(command: String) {
-        val job = viewModelScope.launch {
-            app.agentEngine.executeCommand(command)
-        }
-        app.agentEngine.setCurrentJob(job)
+        app.agentEngine.submitCommand(command = command, scope = viewModelScope)
     }
 
     fun cancelExecution() {
