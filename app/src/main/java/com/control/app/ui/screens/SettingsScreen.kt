@@ -586,11 +586,11 @@ fun SettingsScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "执行过程展示",
+                            text = "执行过程提示",
                             style = MaterialTheme.typography.bodyLarge
                         )
                         Text(
-                            text = "悬浮球运行时显示执行状态",
+                            text = "自动操作时显示状态条和屏幕边缘光晕",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )

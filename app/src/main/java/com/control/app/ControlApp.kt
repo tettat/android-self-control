@@ -1,6 +1,7 @@
 package com.control.app
 
 import android.app.Application
+import android.provider.Settings
 import com.control.app.adb.AdbExecutor
 import com.control.app.agent.AgentEngine
 import com.control.app.agent.SessionManager
@@ -10,6 +11,7 @@ import com.control.app.data.SettingsStore
 import com.control.app.log.ExecutionLogHttpServer
 import com.control.app.log.RelayLogSyncManager
 import com.control.app.prompt.PromptManager
+import com.control.app.service.FloatingBubbleService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -65,6 +67,7 @@ class ControlApp : Application() {
         relayLogSyncManager = RelayLogSyncManager(this, settingsStore, agentEngine, executionLogHttpServer)
         relayLogSyncManager.start()
         adbExecutor.mdnsDiscovery.startDiscovery()
+        startFloatingBubbleByDefault()
 
         appScope.launch(Dispatchers.IO) {
             settingsStore.removeEmbeddedApiDefaultsIfPresent()
@@ -134,6 +137,12 @@ class ControlApp : Application() {
                 needsPairing = true,
                 message = "自动连接失败，请前往设置重新输入配对信息"
             )
+        }
+    }
+
+    private fun startFloatingBubbleByDefault() {
+        if (Settings.canDrawOverlays(this) && !FloatingBubbleService.isRunning.value) {
+            FloatingBubbleService.start(this)
         }
     }
 

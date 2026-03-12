@@ -9,7 +9,13 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.LinearGradient
+import android.graphics.Paint
 import android.graphics.PixelFormat
+import android.graphics.RadialGradient
+import android.graphics.Shader
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.os.Build
@@ -55,9 +61,12 @@ class FloatingBubbleService : Service() {
         private const val CHANNEL_ID = "control_bubble_channel"
         private const val NOTIFICATION_ID = 2
         private const val KEEPALIVE_INTERVAL_MS = 30_000L
+        private const val GLOW_PREVIEW_DURATION_MS = 8_000L
         private const val BUBBLE_SIZE_DP = 52
         private const val ACTION_BTN_SIZE_DP = 44
         private const val MARGIN_DP = 8
+        private const val ACTION_PREVIEW_GLOW = "com.control.app.action.PREVIEW_GLOW"
+        private const val EXTRA_PREVIEW_DURATION_MS = "preview_duration_ms"
 
         private val _isRunning = MutableStateFlow(false)
         val isRunning: StateFlow<Boolean> = _isRunning.asStateFlow()
@@ -75,15 +84,40 @@ class FloatingBubbleService : Service() {
             context.stopService(Intent(context, FloatingBubbleService::class.java))
         }
 
+        fun previewGlow(context: Context, durationMs: Long = GLOW_PREVIEW_DURATION_MS) {
+            val intent = Intent(context, FloatingBubbleService::class.java).apply {
+                action = ACTION_PREVIEW_GLOW
+                putExtra(EXTRA_PREVIEW_DURATION_MS, durationMs)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
+
         // Color constants
         private val COLOR_IDLE = 0xFF1E88E5.toInt()
         private val COLOR_LISTENING = 0xFF00BFA5.toInt()
         private val COLOR_RUNNING = 0xFFFFA726.toInt()
+        private val COLOR_PLANNING = 0xFF5C6BC0.toInt()
+        private val COLOR_CAPTURE = 0xFF29B6F6.toInt()
+        private val COLOR_NAVIGATION = 0xFFFF7043.toInt()
+        private val COLOR_INPUT = 0xFF66BB6A.toInt()
+        private val COLOR_FOCUS = 0xFFAB47BC.toInt()
+        private val COLOR_SYSTEM = 0xFFEF5350.toInt()
+        private val COLOR_WAIT = 0xFF26A69A.toInt()
+        private val COLOR_COMPLETE = 0xFF9CCC65.toInt()
         private val COLOR_MIC = 0xFF00BFA5.toInt()
         private val COLOR_APP = 0xFF7E57C2.toInt()
         private val COLOR_CLOSE = 0xFFEF5350.toInt()
         private val COLOR_STOP = 0xFFFF5722.toInt()
     }
+
+    private data class ExecutionVisualStyle(
+        val bubbleColor: Int,
+        val glowColor: Int
+    )
 
     private lateinit var windowManager: WindowManager
     private lateinit var bubbleView: FrameLayout
@@ -93,15 +127,19 @@ class FloatingBubbleService : Service() {
     private lateinit var bubbleParams: WindowManager.LayoutParams
     private lateinit var menuParams: WindowManager.LayoutParams
 
+    private var edgeGlowOverlay: AutomationEdgeGlowView? = null
     private var overlayPanel: TextView? = null
     private var overlayPanelParams: WindowManager.LayoutParams? = null
     private var showOverlaySetting = true
+    private var isOverlayVisible = true
 
     private var isMenuExpanded = false
     private var isListening = false
     private var isAgentRunning = false
+    private var isGlowPreviewActive = false
     private var pulseAnimator: ObjectAnimator? = null
     private var overlayTickerJob: Job? = null
+    private var glowPreviewJob: Job? = null
     private var latestAgentState: AgentState = AgentState()
 
     private var speechRecognizer: SpeechRecognizer? = null
@@ -117,6 +155,7 @@ class FloatingBubbleService : Service() {
         super.onCreate()
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
         createNotificationChannel()
+        createEdgeGlowOverlay()
         createBubble()
         createMenu()
         createOverlayPanel()
@@ -130,6 +169,7 @@ class FloatingBubbleService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
+        handleIntentAction(intent)
         return START_STICKY
     }
 
@@ -139,10 +179,12 @@ class FloatingBubbleService : Service() {
         _isRunning.value = false
         stopPulse()
         overlayTickerJob?.cancel()
+        glowPreviewJob?.cancel()
         serviceScope.cancel()
         destroySpeechRecognizer()
         try { windowManager.removeView(bubbleView) } catch (_: Exception) {}
         try { windowManager.removeView(menuContainer) } catch (_: Exception) {}
+        try { edgeGlowOverlay?.let { windowManager.removeView(it) } } catch (_: Exception) {}
         try { overlayPanel?.let { windowManager.removeView(it) } } catch (_: Exception) {}
         super.onDestroy()
     }
@@ -244,7 +286,7 @@ class FloatingBubbleService : Service() {
         }
 
         // 1. Stop agent (hidden when not running)
-        stopBtn = makeBtn("⏹", COLOR_STOP, btnSize)
+        stopBtn = makeBtn("⏹", COLOR_STOP)
         stopBtn.setOnClickListener { app.agentEngine.cancel() }
         stopBtn.visibility = View.GONE
         menuContainer.addView(stopBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply {
@@ -252,21 +294,21 @@ class FloatingBubbleService : Service() {
         })
 
         // 2. Mic - tap to start/stop voice
-        micBtn = makeBtn("🎤", COLOR_MIC, btnSize)
+        micBtn = makeBtn("🎤", COLOR_MIC)
         micBtn.setOnClickListener { toggleVoice() }
         menuContainer.addView(micBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply {
             bottomMargin = gap
         })
 
         // 3. Open app
-        val appBtn = makeBtn("📱", COLOR_APP, btnSize)
+        val appBtn = makeBtn("📱", COLOR_APP)
         appBtn.setOnClickListener { openMainApp() }
         menuContainer.addView(appBtn, LinearLayout.LayoutParams(btnSize, btnSize).apply {
             bottomMargin = gap
         })
 
         // 4. Close overlay
-        val closeBtn = makeBtn("✕", COLOR_CLOSE, btnSize)
+        val closeBtn = makeBtn("✕", COLOR_CLOSE)
         closeBtn.setOnClickListener { stopSelf() }
         menuContainer.addView(closeBtn, LinearLayout.LayoutParams(btnSize, btnSize))
 
@@ -285,7 +327,7 @@ class FloatingBubbleService : Service() {
         windowManager.addView(menuContainer, menuParams)
     }
 
-    private fun makeBtn(icon: String, color: Int, size: Int): TextView = TextView(this).apply {
+    private fun makeBtn(icon: String, color: Int): TextView = TextView(this).apply {
         text = icon
         textSize = if (icon == "✕") 18f else 20f
         gravity = Gravity.CENTER
@@ -294,7 +336,32 @@ class FloatingBubbleService : Service() {
         isClickable = true; isFocusable = true
     }
 
-    // ======================== Overlay Panel ========================
+    // ======================== Execution Overlay ========================
+
+    private fun createEdgeGlowOverlay() {
+        edgeGlowOverlay = AutomationEdgeGlowView(this, COLOR_RUNNING).apply {
+            visibility = View.GONE
+        }
+
+        val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
+        else @Suppress("DEPRECATION") WindowManager.LayoutParams.TYPE_PHONE
+
+        val edgeGlowOverlayParams = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            overlayType,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+        }
+
+        windowManager.addView(edgeGlowOverlay, edgeGlowOverlayParams)
+    }
 
     private fun createOverlayPanel() {
         overlayPanel = TextView(this).apply {
@@ -324,6 +391,102 @@ class FloatingBubbleService : Service() {
         }
 
         windowManager.addView(overlayPanel, overlayPanelParams)
+    }
+
+    private fun shouldShowAutomationCue(): Boolean {
+        return isGlowPreviewActive || (isAgentRunning && showOverlaySetting)
+    }
+
+    private fun shouldShowOverlayPanel(): Boolean {
+        return isOverlayVisible && shouldShowAutomationCue()
+    }
+
+    private fun syncExecutionOverlayVisibility() {
+        applyExecutionVisualStyle()
+        val shouldShowCue = shouldShowAutomationCue()
+        val shouldShowPanel = shouldShowOverlayPanel()
+        if (shouldShowPanel) {
+            overlayPanel?.text = if (isGlowPreviewActive && !isAgentRunning) {
+                buildPreviewOverlayText()
+            } else {
+                buildOverlayText(latestAgentState)
+            }
+        }
+        overlayPanel?.visibility = if (shouldShowPanel) View.VISIBLE else View.GONE
+        edgeGlowOverlay?.setAutomationActive(shouldShowCue)
+    }
+
+    private fun applyExecutionVisualStyle() {
+        val style = resolveVisualStyle()
+        updateBubbleColor(style.bubbleColor)
+        edgeGlowOverlay?.setGlowColor(style.glowColor)
+    }
+
+    private fun resolveVisualStyle(): ExecutionVisualStyle {
+        return when {
+            isListening && !isAgentRunning && !isGlowPreviewActive -> {
+                ExecutionVisualStyle(COLOR_LISTENING, COLOR_LISTENING)
+            }
+            isGlowPreviewActive && !isAgentRunning -> {
+                ExecutionVisualStyle(COLOR_RUNNING, COLOR_RUNNING)
+            }
+            isAgentRunning -> resolveAgentVisualStyle(latestAgentState)
+            else -> ExecutionVisualStyle(COLOR_IDLE, COLOR_IDLE)
+        }
+    }
+
+    private fun resolveAgentVisualStyle(state: AgentState): ExecutionVisualStyle {
+        val tool = state.activeTool.lowercase()
+        val status = state.statusMessage.lowercase()
+        val action = state.lastAction.lowercase()
+
+        val color = when {
+            tool in setOf("tap", "tap_element", "tap_region", "swipe", "scroll_down", "scroll_up", "press_back", "press_home", "key_event") -> COLOR_NAVIGATION
+            tool in setOf("input_text", "input_element") -> COLOR_INPUT
+            tool in setOf("launch_app", "load_skills", "zoom_region") -> COLOR_FOCUS
+            tool == "adb_shell" -> COLOR_SYSTEM
+            tool == "wait" -> COLOR_WAIT
+            tool == "complete" -> COLOR_COMPLETE
+            "截图" in status || "截图" in action || "界面树" in action || "初始截图" in action -> COLOR_CAPTURE
+            "规划" in action || "思路" in action || (tool.isBlank() && state.lastThinking.isNotBlank()) -> COLOR_PLANNING
+            else -> COLOR_RUNNING
+        }
+
+        return ExecutionVisualStyle(
+            bubbleColor = color,
+            glowColor = color
+        )
+    }
+
+    private fun handleIntentAction(intent: Intent?) {
+        when (intent?.action) {
+            ACTION_PREVIEW_GLOW -> {
+                val durationMs = intent.getLongExtra(EXTRA_PREVIEW_DURATION_MS, GLOW_PREVIEW_DURATION_MS)
+                startGlowPreview(durationMs.coerceAtLeast(1_000L))
+            }
+        }
+    }
+
+    private fun startGlowPreview(durationMs: Long) {
+        glowPreviewJob?.cancel()
+        glowPreviewJob = serviceScope.launch {
+            isGlowPreviewActive = true
+            mainHandler.post {
+                if (!isAgentRunning && !isListening) {
+                    startPulse()
+                }
+                syncExecutionOverlayVisibility()
+            }
+            delay(durationMs)
+            isGlowPreviewActive = false
+            mainHandler.post {
+                syncExecutionOverlayVisibility()
+                if (!isAgentRunning) {
+                    stopPulse()
+                    updateBubbleColor(if (isListening) COLOR_LISTENING else COLOR_IDLE)
+                }
+            }
+        }
     }
 
     // ======================== Menu Animation ========================
@@ -390,32 +553,32 @@ class FloatingBubbleService : Service() {
 
         speechRecognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onReadyForSpeech(p: Bundle?) {
-                isListening = true
-                updateMicVisual(true)
-                updateBubbleColor(COLOR_LISTENING)
-            }
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buf: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onError(err: Int) {
-                isListening = false
-                updateMicVisual(false)
-                updateBubbleColor(COLOR_IDLE)
-                Log.w(TAG, "Speech error: $err")
-            }
-            override fun onResults(results: Bundle?) {
-                isListening = false
-                updateMicVisual(false)
+            isListening = true
+            updateMicVisual(true)
+            syncExecutionOverlayVisibility()
+        }
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buf: ByteArray?) {}
+        override fun onEndOfSpeech() {}
+        override fun onError(err: Int) {
+            isListening = false
+            updateMicVisual(false)
+            syncExecutionOverlayVisibility()
+            Log.w(TAG, "Speech error: $err")
+        }
+        override fun onResults(results: Bundle?) {
+            isListening = false
+            updateMicVisual(false)
                 val text = results
                     ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull() ?: ""
-                if (text.isNotBlank()) {
-                    executeVoiceCommand(text)
-                } else {
-                    updateBubbleColor(COLOR_IDLE)
-                }
+            if (text.isNotBlank()) {
+                executeVoiceCommand(text)
+            } else {
+                syncExecutionOverlayVisibility()
             }
+        }
             override fun onPartialResults(partial: Bundle?) {}
             override fun onEvent(type: Int, params: Bundle?) {}
         })
@@ -477,10 +640,6 @@ class FloatingBubbleService : Service() {
                     val wasRunning = isAgentRunning
                     isAgentRunning = state.isRunning
 
-                    if (!isListening) {
-                        updateBubbleColor(if (state.isRunning) COLOR_RUNNING else COLOR_IDLE)
-                    }
-
                     // Show/hide stop button
                     if (state.isRunning && !wasRunning) {
                         stopBtn.visibility = View.VISIBLE
@@ -492,13 +651,7 @@ class FloatingBubbleService : Service() {
                         if (isMenuExpanded) syncMenuPosition()
                     }
 
-                    // Update overlay panel
-                    if (state.isRunning && showOverlaySetting) {
-                        overlayPanel?.text = buildOverlayText(state)
-                        overlayPanel?.visibility = View.VISIBLE
-                    } else {
-                        overlayPanel?.visibility = View.GONE
-                    }
+                    syncExecutionOverlayVisibility()
                 }
             }
         }
@@ -507,19 +660,14 @@ class FloatingBubbleService : Service() {
     private fun observeOverlayVisibility() {
         serviceScope.launch {
             app.agentEngine.overlayVisible.collect { visible ->
+                isOverlayVisible = visible
                 mainHandler.post {
+                    val shouldKeepBubbleVisible = visible || isAgentRunning || isGlowPreviewActive
+                    bubbleView.visibility = if (shouldKeepBubbleVisible) View.VISIBLE else View.GONE
                     if (!visible) {
-                        overlayPanel?.visibility = View.GONE
-                        bubbleView.visibility = View.GONE
                         menuContainer.visibility = View.GONE
-                    } else {
-                        bubbleView.visibility = View.VISIBLE
-                        // Only show overlay panel if agent is running and setting is enabled
-                        if (isAgentRunning && showOverlaySetting) {
-                            overlayPanel?.visibility = View.VISIBLE
-                        }
-                        // Don't restore menu - let it stay collapsed
                     }
+                    syncExecutionOverlayVisibility()
                 }
             }
         }
@@ -530,7 +678,7 @@ class FloatingBubbleService : Service() {
             app.settingsStore.showExecutionOverlay.collect { show ->
                 showOverlaySetting = show
                 mainHandler.post {
-                    if (!show) overlayPanel?.visibility = View.GONE
+                    syncExecutionOverlayVisibility()
                 }
             }
         }
@@ -542,7 +690,7 @@ class FloatingBubbleService : Service() {
             while (isActive) {
                 delay(1000)
                 mainHandler.post {
-                    if (isAgentRunning && showOverlaySetting) {
+                    if (shouldShowOverlayPanel()) {
                         overlayPanel?.text = buildOverlayText(latestAgentState)
                     }
                 }
@@ -572,6 +720,10 @@ class FloatingBubbleService : Service() {
                 append("\n思路: ${state.lastThinking.take(120)}")
             }
         }
+    }
+
+    private fun buildPreviewOverlayText(): String {
+        return "自动化光晕预览中\n当前为调试预览，不依赖 AI 或 ADB 执行"
     }
 
     private fun formatDuration(totalSeconds: Long): String {
@@ -658,5 +810,134 @@ class FloatingBubbleService : Service() {
             .setOngoing(true).setSilent(true)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+    }
+}
+
+private class AutomationEdgeGlowView(
+    context: Context,
+    private var glowColor: Int
+) : View(context) {
+
+    private val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val cornerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val density = resources.displayMetrics.density
+    private val edgeSizePx = 44f * density
+    private val cornerRadiusPx = 110f * density
+    private var glowStrength = 0f
+    private var pulseAnimator: ValueAnimator? = null
+
+    fun setGlowColor(color: Int) {
+        if (glowColor != color) {
+            glowColor = color
+            if (visibility == View.VISIBLE) {
+                invalidate()
+            }
+        }
+    }
+
+    fun setAutomationActive(active: Boolean) {
+        if (active) {
+            if (visibility != View.VISIBLE) {
+                visibility = View.VISIBLE
+            }
+            startPulse()
+        } else {
+            stopPulse()
+            visibility = View.GONE
+        }
+    }
+
+    override fun onDetachedFromWindow() {
+        stopPulse()
+        super.onDetachedFromWindow()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (glowStrength <= 0f || width == 0 || height == 0) return
+
+        val w = width.toFloat()
+        val h = height.toFloat()
+        val strong = colorWithScaledAlpha(68, glowStrength)
+        val soft = colorWithScaledAlpha(18, glowStrength)
+
+        edgePaint.shader = LinearGradient(
+            0f, 0f, 0f, edgeSizePx,
+            intArrayOf(strong, soft, Color.TRANSPARENT),
+            floatArrayOf(0f, 0.52f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(0f, 0f, w, edgeSizePx, edgePaint)
+
+        edgePaint.shader = LinearGradient(
+            0f, h, 0f, h - edgeSizePx,
+            intArrayOf(strong, soft, Color.TRANSPARENT),
+            floatArrayOf(0f, 0.52f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(0f, h - edgeSizePx, w, h, edgePaint)
+
+        edgePaint.shader = LinearGradient(
+            0f, 0f, edgeSizePx, 0f,
+            intArrayOf(strong, soft, Color.TRANSPARENT),
+            floatArrayOf(0f, 0.52f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(0f, 0f, edgeSizePx, h, edgePaint)
+
+        edgePaint.shader = LinearGradient(
+            w, 0f, w - edgeSizePx, 0f,
+            intArrayOf(strong, soft, Color.TRANSPARENT),
+            floatArrayOf(0f, 0.52f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawRect(w - edgeSizePx, 0f, w, h, edgePaint)
+
+        drawCornerGlow(canvas, 0f, 0f, strong, soft)
+        drawCornerGlow(canvas, w, 0f, strong, soft)
+        drawCornerGlow(canvas, 0f, h, strong, soft)
+        drawCornerGlow(canvas, w, h, strong, soft)
+    }
+
+    private fun drawCornerGlow(canvas: Canvas, cx: Float, cy: Float, strong: Int, soft: Int) {
+        cornerPaint.shader = RadialGradient(
+            cx, cy, cornerRadiusPx,
+            intArrayOf(strong, soft, Color.TRANSPARENT),
+            floatArrayOf(0f, 0.45f, 1f),
+            Shader.TileMode.CLAMP
+        )
+        canvas.drawCircle(cx, cy, cornerRadiusPx, cornerPaint)
+    }
+
+    private fun startPulse() {
+        if (pulseAnimator != null) return
+        pulseAnimator = ValueAnimator.ofFloat(0.72f, 1f).apply {
+            duration = 1800
+            repeatCount = ValueAnimator.INFINITE
+            repeatMode = ValueAnimator.REVERSE
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                glowStrength = it.animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    private fun stopPulse() {
+        pulseAnimator?.cancel()
+        pulseAnimator = null
+        glowStrength = 0f
+        invalidate()
+    }
+
+    private fun colorWithScaledAlpha(baseAlpha: Int, strength: Float): Int {
+        val alpha = (baseAlpha * strength).toInt().coerceIn(0, 255)
+        return Color.argb(
+            alpha,
+            Color.red(glowColor),
+            Color.green(glowColor),
+            Color.blue(glowColor)
+        )
     }
 }
