@@ -5,6 +5,9 @@ object DefaultPrompts {
     const val PROMPT_KEY_SYSTEM = "system_prompt"
     const val PROMPT_KEY_ACTION = "action_prompt"
 
+    /** 默认指令：输入框的初始预填内容 */
+    const val DEFAULT_INSTRUCTION = "打开计算器，输入123+456"
+
     val SYSTEM_PROMPT = """
 你是一个安卓手机自动化助手。你通过工具来控制手机。
 

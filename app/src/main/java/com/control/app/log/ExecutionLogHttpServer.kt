@@ -345,6 +345,8 @@ class ExecutionLogHttpServer(
                   <div class="meta">耗时: ${escapeHtml(ExecutionLogFormatter.formatDurationMs(step.durationMs))}</div>
                   ${if (breakdownSummary.isNotBlank()) """<div class="meta">${escapeHtml(breakdownSummary)}</div>""" else ""}
                   ${if (presentation.subtitle.isNotBlank()) """<div class="meta">${escapeHtml(presentation.subtitle)}</div>""" else ""}
+                  ${if (step.toolArguments.isNotBlank()) """<div class="meta">参数: ${escapeHtml(step.toolArguments)}</div>""" else ""}
+                  ${if (step.intent.isNotBlank()) """<div class="meta">意图: ${escapeHtml(step.intent)}</div>""" else ""}
                 </li>
             """.trimIndent()
         }.joinToString("")
@@ -364,236 +366,92 @@ class ExecutionLogHttpServer(
               <title>Control 执行日志</title>
               <style>
                 :root {
-                  color-scheme: light;
-                  --bg: #f4efe8;
-                  --panel: #fffaf2;
-                  --ink: #1f1b16;
-                  --muted: #706356;
-                  --line: #d9cdbf;
+                  --bg: #f5f2ee;
+                  --panel: #fff;
+                  --ink: #1a1a1a;
+                  --muted: #6b6b6b;
+                  --line: #e0ddd8;
                   --accent: #17624d;
-                  --accent-soft: #dcefe8;
                   --warn: #9f3a1d;
-                  --warn-soft: #f9e3d9;
                 }
                 * { box-sizing: border-box; }
-                body {
-                  margin: 0;
-                  font-family: "SF Mono", "Menlo", "JetBrains Mono", monospace;
-                  background:
-                    radial-gradient(circle at top left, #fff7dd, transparent 30%),
-                    linear-gradient(180deg, #f8f3ec 0%, var(--bg) 100%);
-                  color: var(--ink);
-                }
-                .page {
-                  max-width: 1120px;
-                  margin: 0 auto;
-                  padding: 24px 16px 48px;
-                }
-                .hero {
-                  background: var(--panel);
-                  border: 1px solid var(--line);
-                  border-radius: 20px;
-                  padding: 20px;
-                  box-shadow: 0 18px 40px rgba(31, 27, 22, 0.07);
-                }
-                h1, h2, h3 { margin: 0; }
-                p, ul { margin: 0; }
-                .hero-top, .stats, .cards, .session-tabs, .footer-links {
+                body { margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--ink); font-size: 15px; line-height: 1.5; }
+                .page { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
+                .head {
                   display: flex;
                   flex-wrap: wrap;
-                  gap: 12px;
+                  align-items: baseline;
+                  gap: 12px 20px;
+                  margin-bottom: 16px;
+                  padding-bottom: 12px;
+                  border-bottom: 1px solid var(--line);
                 }
-                .hero-top {
-                  justify-content: space-between;
-                  align-items: flex-start;
+                .head h1 { margin: 0; font-size: 1.25rem; font-weight: 600; }
+                .head .meta { color: var(--muted); font-size: 13px; }
+                .status { font-size: 13px; padding: 4px 10px; border-radius: 6px; background: ${if (agentState.isRunning) "#e8f4f0" else "#fce8e4"}; color: ${if (agentState.isRunning) "var(--accent)" else "var(--warn)"}; }
+                .bar {
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: 8px 16px;
+                  font-size: 13px;
+                  color: var(--muted);
                   margin-bottom: 16px;
                 }
-                .status-badge {
-                  display: inline-flex;
-                  align-items: center;
-                  gap: 8px;
-                  padding: 8px 12px;
-                  border-radius: 999px;
-                  background: ${if (agentState.isRunning) "var(--accent-soft)" else "var(--warn-soft)"};
-                  color: ${if (agentState.isRunning) "var(--accent)" else "var(--warn)"};
-                }
-                .stats .card, .cards > section, .entry, .session-card {
-                  background: var(--panel);
-                  border: 1px solid var(--line);
-                  border-radius: 18px;
-                }
-                .stats .card {
-                  flex: 1 1 180px;
-                  padding: 14px;
-                }
-                .cards {
-                  margin-top: 16px;
-                  align-items: flex-start;
-                }
-                .cards > section {
-                  flex: 1 1 320px;
-                  padding: 16px;
-                }
-                .cards ul {
-                  padding-left: 18px;
-                }
-                .meta {
-                  color: var(--muted);
-                  font-size: 13px;
-                  line-height: 1.6;
-                }
-                .session-tabs {
-                  margin: 18px 0 14px;
-                }
+                .bar strong { color: var(--ink); }
+                .links { font-size: 13px; }
+                .links a { color: var(--accent); text-decoration: none; }
+                .links a:hover { text-decoration: underline; }
+                .session-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
                 .session-tab {
-                  display: inline-flex;
-                  align-items: center;
-                  padding: 8px 12px;
-                  border-radius: 999px;
+                  padding: 6px 12px;
+                  border-radius: 6px;
                   border: 1px solid var(--line);
                   color: var(--ink);
                   text-decoration: none;
-                  background: rgba(255, 250, 242, 0.7);
+                  font-size: 13px;
+                  background: var(--panel);
                 }
-                .session-tab.active {
-                  background: var(--accent);
-                  border-color: var(--accent);
-                  color: #fff;
-                }
-                .session-list {
-                  display: grid;
-                  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-                  gap: 12px;
-                }
-                .session-card {
-                  padding: 14px;
-                }
-                .session-title {
-                  font-size: 14px;
-                  font-weight: 700;
-                  margin-bottom: 6px;
-                }
-                .log-list {
-                  display: grid;
-                  gap: 12px;
-                  margin-top: 14px;
-                }
+                .session-tab.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+                .timing { font-size: 13px; color: var(--muted); margin-top: 8px; }
+                .timing ul { margin: 4px 0 0; padding-left: 18px; }
+                .timing .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+                .log-list { display: flex; flex-direction: column; gap: 10px; }
                 .entry {
-                  padding: 14px;
-                }
-                .entry-header {
-                  display: flex;
-                  justify-content: space-between;
-                  gap: 12px;
-                  margin-bottom: 10px;
-                  font-size: 12px;
-                  color: var(--muted);
-                }
-                .entry-type {
-                  padding: 4px 8px;
-                  border-radius: 999px;
-                  background: #efe7dc;
-                  color: var(--ink);
-                }
-                .entry h3 {
-                  font-size: 15px;
-                  margin-bottom: 8px;
-                }
-                .entry pre {
-                  margin: 0;
-                  white-space: pre-wrap;
-                  word-break: break-word;
-                  font-family: inherit;
-                  line-height: 1.55;
-                }
-                .entry-image {
-                  margin-top: 12px;
-                }
-                .entry-image img {
-                  display: block;
-                  width: min(100%, 420px);
-                  border-radius: 12px;
+                  background: var(--panel);
                   border: 1px solid var(--line);
-                  background: rgba(255, 250, 242, 0.7);
+                  border-radius: 10px;
+                  padding: 12px 14px;
                 }
-                .entry.error { border-color: #e7b7a6; }
-                .entry.info { border-color: #c9d6d2; }
-                .entry.action_executed { border-color: #bfdac5; }
-                .entry.api_request, .entry.api_response { border-color: #d4caec; }
-                .empty {
-                  padding: 20px;
-                  border: 1px dashed var(--line);
-                  border-radius: 18px;
-                  text-align: center;
-                  color: var(--muted);
-                  background: rgba(255, 250, 242, 0.65);
-                }
-                a { color: var(--accent); }
-                .footer-links {
-                  margin-top: 14px;
-                }
+                .entry-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 6px; font-size: 12px; color: var(--muted); }
+                .entry-type { font-weight: 600; color: var(--ink); }
+                .entry h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+                .entry pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.5; font-family: ui-monospace, monospace; }
+                .entry-image { margin-top: 10px; }
+                .entry-image img { display: block; max-width: 100%; border-radius: 8px; border: 1px solid var(--line); }
+                .entry.error { border-left: 3px solid #d32f2f; }
+                .entry.info { border-left: 3px solid #2e7d32; }
+                .entry.action_executed { border-left: 3px solid #1976d2; }
+                .entry.api_request, .entry.api_response { border-left: 3px solid #7b1fa2; }
+                .empty { padding: 24px; text-align: center; color: var(--muted); font-size: 14px; background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; }
               </style>
             </head>
             <body>
               <main class="page">
-                <section class="hero">
-                  <div class="hero-top">
-                    <div>
-                      <h1>Control 执行日志</h1>
-                      <p class="meta">当前查看: ${escapeHtml(selectedTitle)} · 每 5 秒自动刷新</p>
-                    </div>
-                    <div class="status-badge">${if (agentState.isRunning) "任务执行中" else "空闲"} · ${escapeHtml(agentState.statusMessage)}</div>
-                  </div>
-                  <div class="stats">
-                    <div class="card">
-                      <div class="meta">最近动作</div>
-                      <strong>${escapeHtml(agentState.lastAction.ifBlank { "无" })}</strong>
-                    </div>
-                    <div class="card">
-                      <div class="meta">当前工具</div>
-                      <strong>${escapeHtml(agentState.activeTool.ifBlank { "无" })}</strong>
-                    </div>
-                    <div class="card">
-                      <div class="meta">执行轮次</div>
-                      <strong>${agentState.currentRound} / ${agentState.maxRounds}</strong>
-                    </div>
-                    <div class="card">
-                      <div class="meta">日志服务端口</div>
-                      <strong>${snapshot.port}</strong>
-                    </div>
-                  </div>
-                  <div class="cards">
-                    <section>
-                      <h2>访问地址</h2>
-                      <ul class="meta">$accessUrls</ul>
-                    </section>
-                    <section>
-                      <h2>接口</h2>
-                      <div class="footer-links meta">
-                        <a href="$apiBase">$apiBase</a>
-                        <a href="/api/sessions">/api/sessions</a>
-                        <a href="/health">/health</a>
-                      </div>
-                    </section>
-                    <section>
-                      <h2>步骤耗时</h2>
-                      $stepTimingSection
-                    </section>
-                  </div>
-                </section>
-
+                <div class="head">
+                  <h1>执行日志</h1>
+                  <span class="meta">${escapeHtml(selectedTitle)} · 每 5 秒刷新</span>
+                  <span class="status">${if (agentState.isRunning) "执行中" else "空闲"} · ${escapeHtml(agentState.statusMessage)}</span>
+                </div>
+                <div class="bar">
+                  <span><strong>最近:</strong> ${escapeHtml(agentState.lastAction.ifBlank { "—" })}</span>
+                  <span><strong>轮次:</strong> ${agentState.currentRound}/${agentState.maxRounds}</span>
+                  <span class="links">
+                    <a href="/">/</a> · <a href="$apiBase">/api/logs</a> · <a href="/api/sessions">/api/sessions</a> · <a href="/health">/health</a>
+                  </span>
+                </div>
+                ${if (agentState.stepTimings.isNotEmpty()) """<div class="timing"><strong>步骤耗时</strong>$stepTimingSection</div>""" else ""}
                 <div class="session-tabs">$sessionTabs</div>
-
-                <section class="cards">
-                  <section>
-                    <h2>会话概览</h2>
-                    <div class="session-list">$sessionCards</div>
-                  </section>
-                </section>
-
-                <section class="log-list">
-                  $entryCards
-                </section>
+                <section class="log-list">$entryCards</section>
               </main>
             </body>
             </html>

@@ -88,6 +88,8 @@ data class TimingBreakdown(
 data class StepTiming(
     val label: String,
     val tool: String = "",
+    val toolArguments: String = "",
+    val intent: String = "",
     val startedAtMs: Long,
     val finishedAtMs: Long,
     val durationMs: Long,
@@ -103,6 +105,8 @@ data class AgentState(
     val lastThinking: String = "",
     val activeTool: String = "",
     val lastAction: String = "",
+    val currentToolArguments: String = "",
+    val currentStepIntent: String = "",
     val taskStartedAtMs: Long = 0L,
     val phaseStartedAtMs: Long = 0L,
     val lastProgressAtMs: Long = 0L,

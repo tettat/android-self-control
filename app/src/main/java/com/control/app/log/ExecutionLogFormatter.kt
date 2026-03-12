@@ -165,6 +165,8 @@ object ExecutionLogFormatter {
                         put("model_ms", step.breakdown.modelMs ?: JSONObject.NULL)
                         put("tool_ms", step.breakdown.toolMs ?: JSONObject.NULL)
                         put("timingBreakdownSummary", formatTimingBreakdown(step.breakdown))
+                        put("toolArguments", step.toolArguments)
+                        put("intent", step.intent)
                     }
                 )
             }
@@ -303,6 +305,14 @@ object ExecutionLogFormatter {
             if (presentation.subtitle.isNotBlank()) {
                 append(" | ")
                 append(presentation.subtitle)
+            }
+            if (step.toolArguments.isNotBlank()) {
+                append(" | 参数 ")
+                append(step.toolArguments)
+            }
+            if (step.intent.isNotBlank()) {
+                append(" | 意图 ")
+                append(step.intent)
             }
         }
     }

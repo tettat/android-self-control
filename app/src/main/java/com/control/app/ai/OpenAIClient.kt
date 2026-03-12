@@ -201,6 +201,8 @@ class OpenAIClient {
             put("messages", messages)
             put("tools", tools)
             put("tool_choice", "auto")
+            put("parallel_function_calls", true)
+            put("parallel_tool_calls", true)
             if (!usesNewTokenParam) {
                 put("temperature", 0.1)
             }

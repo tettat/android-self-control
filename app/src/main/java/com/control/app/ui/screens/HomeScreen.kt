@@ -105,6 +105,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import androidx.core.content.FileProvider
 import com.control.app.ControlApp
+import com.control.app.prompt.DefaultPrompts
 import com.control.app.agent.AgentState
 import com.control.app.agent.DebugLogEntry
 import com.control.app.agent.DebugLogType
@@ -342,7 +343,7 @@ fun HomeScreen(
     }
 
     // Text input state
-    var textInput by remember { mutableStateOf("") }
+    var textInput by remember { mutableStateOf(DefaultPrompts.DEFAULT_INSTRUCTION) }
 
     LaunchedEffect(Unit) {
         viewModel.ensureAdbReady()
@@ -573,7 +574,7 @@ fun HomeScreen(
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                         keyboardActions = KeyboardActions(
                             onSend = {
-                                if (textInput.isNotBlank() && !agentState.isRunning) {
+                                if (textInput.isNotBlank() && !agentState.isRunning && !adbStartupState.isConnecting) {
                                     viewModel.executeCommand(textInput.trim())
                                     textInput = ""
                                 }
@@ -583,17 +584,17 @@ fun HomeScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     IconButton(
                         onClick = {
-                            if (textInput.isNotBlank() && !agentState.isRunning) {
+                            if (textInput.isNotBlank() && !agentState.isRunning && !adbStartupState.isConnecting) {
                                 viewModel.executeCommand(textInput.trim())
                                 textInput = ""
                             }
                         },
-                        enabled = textInput.isNotBlank() && !agentState.isRunning
+                        enabled = textInput.isNotBlank() && !agentState.isRunning && !adbStartupState.isConnecting
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Send,
                             contentDescription = "发送",
-                            tint = if (textInput.isNotBlank() && !agentState.isRunning)
+                            tint = if (textInput.isNotBlank() && !agentState.isRunning && !adbStartupState.isConnecting)
                                 MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
                         )
@@ -955,6 +956,24 @@ private fun StepTimingSummary(stepTimings: List<StepTiming>) {
             if (presentation.subtitle.isNotBlank()) {
                 Text(
                     text = presentation.subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (step.toolArguments.isNotBlank()) {
+                Text(
+                    text = "参数 ${step.toolArguments}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (step.intent.isNotBlank()) {
+                Text(
+                    text = "意图 ${step.intent}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 2,

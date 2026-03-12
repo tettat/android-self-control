@@ -297,6 +297,35 @@ tasks.register("installAndLaunchDebugFast") {
     }
 }
 
+tasks.register("installAndLaunchDebug") {
+    group = "install"
+    description = "Installs the debug APK and launches the app on the target device."
+    dependsOn("installDebug")
+
+    doLast {
+        val adbExecutable = adbExecutableProvider.get()
+        val serial = resolveTargetDeviceSerial(adbExecutable)
+        logger.lifecycle("Launching $debugLaunchComponent on $serial")
+
+        exec {
+            commandLine(
+                adbExecutable,
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "start",
+                "-n",
+                debugLaunchComponent,
+                "-a",
+                "android.intent.action.MAIN",
+                "-c",
+                "android.intent.category.LAUNCHER"
+            )
+        }
+    }
+}
+
 dependencies {
     // Compose BOM
     val composeBom = platform("androidx.compose:compose-bom:2024.02.00")

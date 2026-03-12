@@ -114,6 +114,8 @@ class AgentEngine(
         activeTool: String = _agentState.value.activeTool,
         lastThinking: String = _agentState.value.lastThinking,
         lastAction: String = _agentState.value.lastAction,
+        toolArguments: String = _agentState.value.currentToolArguments,
+        stepIntent: String = _agentState.value.currentStepIntent,
         phaseTiming: TimingBreakdown? = null
     ) {
         val prev = _agentState.value
@@ -125,6 +127,8 @@ class AgentEngine(
             activeTool = activeTool,
             lastThinking = lastThinking,
             lastAction = lastAction,
+            currentToolArguments = toolArguments,
+            currentStepIntent = stepIntent,
             phaseStartedAtMs = if (statusChanged) now else prev.phaseStartedAtMs,
             stepTimings = if (statusChanged) finalizeCurrentStep(prev, now) else prev.stepTimings,
             currentPhaseTiming = when {
@@ -153,6 +157,8 @@ class AgentEngine(
         return state.stepTimings + StepTiming(
             label = state.statusMessage,
             tool = state.activeTool,
+            toolArguments = state.currentToolArguments,
+            intent = state.currentStepIntent,
             startedAtMs = state.phaseStartedAtMs,
             finishedAtMs = endTimeMs,
             durationMs = durationMs,
@@ -285,7 +291,8 @@ class AgentEngine(
             setProgress(
                 statusMessage = "正在截图...",
                 activeTool = "",
-                lastAction = "准备初始截图与界面树"
+                lastAction = "准备初始截图与界面树",
+                stepIntent = "准备初始截图与界面树"
             )
 
             val initialCapture = captureScreen(settings.screenshotScale)
@@ -335,7 +342,8 @@ class AgentEngine(
                     currentRound = step,
                     statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在调用AI...",
                     activeTool = "",
-                    lastAction = "等待 AI 决策"
+                    lastAction = "等待 AI 决策",
+                    stepIntent = "调用模型生成下一步动作"
                 )
 
                 Log.d(TAG, "=== Step $step/${settings.maxRounds} ===")
@@ -426,7 +434,8 @@ class AgentEngine(
                             )
                             setProgress(
                                 statusMessage = "反思中：已收到总结，请调用 complete 结束",
-                                lastAction = "等待模型调用 complete…"
+                                lastAction = "等待模型调用 complete…",
+                                stepIntent = "等待模型调用 complete 结束"
                             )
                             addLog(
                                 DebugLogEntry(
@@ -476,10 +485,13 @@ class AgentEngine(
 
                         Log.d(TAG, "AI requested tools: $toolNames")
 
+                        val stepIntentFromAssistant = extractTextContent(result.rawMessage).trim().take(400)
+
                         setProgress(
                             statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${executableToolNames.firstOrNull().orEmpty()}...",
                             activeTool = executableToolNames.firstOrNull().orEmpty(),
-                            lastAction = "AI 规划了 ${toolNames.size} 个动作，本轮执行 ${executableToolNames.size} 个"
+                            lastAction = "AI 规划了 ${toolNames.size} 个动作，本轮执行 ${executableToolNames.size} 个",
+                            stepIntent = stepIntentFromAssistant
                         )
 
                         var taskCompleted = false
@@ -503,7 +515,9 @@ class AgentEngine(
                                 setProgress(
                                     statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolCall.functionName}...",
                                     activeTool = toolCall.functionName,
-                                    lastAction = "开始执行 ${toolCall.functionName}"
+                                    lastAction = "开始执行 ${toolCall.functionName}",
+                                    toolArguments = formatToolArguments(toolCall.arguments),
+                                    stepIntent = stepIntentFromAssistant
                                 )
 
                                 // Hide overlay before interactive actions
@@ -608,7 +622,9 @@ class AgentEngine(
                                 setProgress(
                                     statusMessage = "第 ${step}/${settings.maxRounds} 步: ${toolCall.functionName} 失败",
                                     activeTool = toolCall.functionName,
-                                    lastAction = errMsg.take(120)
+                                    lastAction = errMsg.take(120),
+                                    toolArguments = formatToolArguments(toolCall.arguments),
+                                    stepIntent = stepIntentFromAssistant
                                 )
                             }
                         }
@@ -643,7 +659,8 @@ class AgentEngine(
                             )
                             setProgress(
                                 statusMessage = "反思中：总结做对/做错的地方，并可选保存技巧",
-                                lastAction = "等待反思结果…"
+                                lastAction = "等待反思结果…",
+                                stepIntent = "总结做对/做错的地方并可选保存技巧"
                             )
                         } else {
                         val shouldCaptureFreshScreen = shouldCaptureAfterToolCalls(
@@ -670,7 +687,8 @@ class AgentEngine(
                             setProgress(
                                 statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在截图...",
                                 activeTool = "",
-                                lastAction = "动作执行完成，刷新界面"
+                                lastAction = "动作执行完成，刷新界面",
+                                stepIntent = "动作执行完成，刷新界面"
                             )
 
                             val followUpCapture = captureScreen(settings.screenshotScale)
@@ -897,6 +915,15 @@ class AgentEngine(
         )
 
         Log.d(TAG, "History compressed: $originalSize -> ${messageHistory.size} messages")
+    }
+
+    /** Format tool call arguments for step timing log (compact one-line). */
+    private fun formatToolArguments(args: JsonObject): String {
+        if (args.isEmpty()) return ""
+        return args.entries.joinToString(", ") { (k, v) ->
+            val vStr = (v as? JsonPrimitive)?.content ?: v.toString()
+            "$k=${vStr.take(80)}"
+        }.take(400)
     }
 
     /**

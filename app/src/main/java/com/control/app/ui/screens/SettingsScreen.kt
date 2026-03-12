@@ -32,6 +32,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Error
 import androidx.compose.material.icons.outlined.Info
@@ -54,6 +55,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -75,6 +77,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.control.app.ControlApp
 import com.control.app.adb.PairingRelayClient
+import com.control.app.agent.AppSkill
 import com.control.app.data.AppSettings
 import com.control.app.log.ExecutionLogServerStatus
 import com.control.app.ui.navigation.Routes
@@ -141,6 +144,23 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     val settings = app.settingsStore.settings
 
+    private val _skills = MutableStateFlow<List<AppSkill>>(emptyList())
+    val skills: StateFlow<List<AppSkill>> = _skills.asStateFlow()
+
+    fun loadSkills() {
+        _skills.value = app.skillStore.getAllSkills()
+    }
+
+    fun deleteSkill(packageName: String) {
+        app.skillStore.deleteSkill(packageName)
+        loadSkills()
+    }
+
+    fun clearAllSkills() {
+        app.skillStore.clearAllSkills()
+        loadSkills()
+    }
+
     private val _adbStatus = MutableStateFlow(AdbStatus())
     val adbStatus: StateFlow<AdbStatus> = _adbStatus.asStateFlow()
 
@@ -170,6 +190,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     init {
         refreshAdbStatus()
         app.ensureAdbReady()
+        loadSkills()
     }
 
     override fun onCleared() {
@@ -449,7 +470,10 @@ fun SettingsScreen(
     val relayError by viewModel.relayError.collectAsStateWithLifecycle()
     val currentChannelUrl by viewModel.currentChannelUrl.collectAsStateWithLifecycle()
     val executionLogServerStatus by viewModel.executionLogServerStatus.collectAsStateWithLifecycle()
+    val skills by viewModel.skills.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) { viewModel.loadSkills() }
 
     Scaffold(
         topBar = {
@@ -602,6 +626,14 @@ fun SettingsScreen(
                 }
             }
 
+            // Accumulated skills (persisted by SkillStore)
+            SectionHeader(title = "应用技巧")
+            AccumulatedSkillsCard(
+                skills = skills,
+                onDeleteSkill = { viewModel.deleteSkill(it) },
+                onClearAll = { viewModel.clearAllSkills() }
+            )
+
             // Voice Configuration
             SectionHeader(title = "语音配置")
             SettingsCard {
@@ -687,6 +719,112 @@ fun SettingsScreen(
             UsageTipsCard()
 
             Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+private fun AccumulatedSkillsCard(
+    skills: List<AppSkill>,
+    onDeleteSkill: (String) -> Unit,
+    onClearAll: () -> Unit
+) {
+    val dateFormat = remember { java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()) }
+
+    SettingsCard {
+        Text(
+            text = "智能体执行任务时积累的应用操作技巧，已持久化保存。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(bottom = 12.dp)
+        )
+        if (skills.isEmpty()) {
+            Text(
+                text = "暂无积累的技巧，完成任务并反思后会在此显示。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            return@SettingsCard
+        }
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            skills.forEach { skill ->
+                var expanded by remember(skill.packageName) { mutableStateOf(false) }
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { expanded = !expanded }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = skill.appName,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "${skill.packageName} · ${skill.tips.size} 条技巧",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = dateFormat.format(java.util.Date(skill.lastUpdated)),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            IconButton(
+                                onClick = { onDeleteSkill(skill.packageName) },
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Delete,
+                                    contentDescription = "删除该应用技巧"
+                                )
+                            }
+                            Icon(
+                                imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                contentDescription = if (expanded) "收起" else "展开"
+                            )
+                        }
+                    }
+                    AnimatedVisibility(
+                        visible = expanded,
+                        enter = expandVertically(),
+                        exit = shrinkVertically()
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 8.dp, bottom = 8.dp)
+                                .background(
+                                    MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f),
+                                    RoundedCornerShape(8.dp)
+                                )
+                                .padding(12.dp)
+                        ) {
+                            skill.tips.forEachIndexed { i, tip ->
+                                Text(
+                                    text = "${i + 1}. $tip",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.padding(vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onClearAll,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("清空全部技巧")
+            }
         }
     }
 }

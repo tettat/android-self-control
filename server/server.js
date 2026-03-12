@@ -195,6 +195,34 @@ const logsHtml = `<!DOCTYPE html>
     font-size: 12px;
     margin-right: 8px;
   }
+  .auto-refresh-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 12px;
+  }
+  .toggle {
+    position: relative;
+    width: 44px;
+    height: 24px;
+    background: rgba(255,255,255,0.12);
+    border-radius: 12px;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+  .toggle.on { background: #42a5f5; }
+  .toggle::after {
+    content: '';
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    width: 20px;
+    height: 20px;
+    background: #fff;
+    border-radius: 50%;
+    transition: transform 0.2s;
+  }
+  .toggle.on::after { transform: translateX(20px); }
   a { color: #90caf9; }
   @media (max-width: 900px) {
     .grid { grid-template-columns: 1fr; }
@@ -205,7 +233,11 @@ const logsHtml = `<!DOCTYPE html>
 <div class="page">
   <div class="hero">
     <h1 style="margin: 0 0 8px;">Control Relay Logs</h1>
-    <div class="meta">这里展示通过 App 主动同步到 relay server 的最新执行日志。页面每 5 秒自动刷新一次。</div>
+    <div class="meta">这里展示通过 App 主动同步到 relay server 的最新执行日志。</div>
+    <div class="auto-refresh-row">
+      <span class="meta">自动刷新 (每 5 秒)</span>
+      <div id="autoRefreshToggle" class="toggle" onclick="toggleAutoRefresh()" title="开启/关闭自动刷新"></div>
+    </div>
   </div>
 
   <div class="grid">
@@ -222,7 +254,37 @@ const logsHtml = `<!DOCTYPE html>
 </div>
 
 <script>
-const state = { selectedId: null, timer: null };
+const AUTO_REFRESH_KEY = 'control-logs-autoRefresh';
+const REFRESH_INTERVAL_MS = 5000;
+
+const state = { selectedId: null, timer: null, autoRefresh: true };
+
+function getStoredAutoRefresh() {
+  try {
+    const v = localStorage.getItem(AUTO_REFRESH_KEY);
+    return v === null ? true : v === 'true';
+  } catch (_) { return true; }
+}
+
+function setStoredAutoRefresh(on) {
+  try { localStorage.setItem(AUTO_REFRESH_KEY, String(on)); } catch (_) {}
+}
+
+function applyAutoRefresh(on) {
+  state.autoRefresh = on;
+  setStoredAutoRefresh(on);
+  const el = document.getElementById('autoRefreshToggle');
+  if (el) el.classList.toggle('on', on);
+  if (state.timer) {
+    clearInterval(state.timer);
+    state.timer = null;
+  }
+  if (on) state.timer = setInterval(loadDevices, REFRESH_INTERVAL_MS);
+}
+
+function toggleAutoRefresh() {
+  applyAutoRefresh(!state.autoRefresh);
+}
 
 function escapeHtml(value) {
   return String(value || '')
@@ -302,8 +364,9 @@ async function selectDevice(deviceId) {
   await loadDevices();
 }
 
+state.autoRefresh = getStoredAutoRefresh();
+applyAutoRefresh(state.autoRefresh);
 loadDevices();
-state.timer = setInterval(loadDevices, 5000);
 </script>
 </body>
 </html>`;
