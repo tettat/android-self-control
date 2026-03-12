@@ -932,6 +932,7 @@ private fun StepTimingSummary(stepTimings: List<StepTiming>) {
         Spacer(modifier = Modifier.height(4.dp))
         stepTimings.forEachIndexed { index, step ->
             val presentation = ExecutionLogFormatter.describeStepTiming(step)
+            val breakdownSummary = ExecutionLogFormatter.formatTimingBreakdown(step.breakdown)
             Text(
                 text = "${index + 1}. [${presentation.category}] ${presentation.title}",
                 style = MaterialTheme.typography.bodySmall,
@@ -944,6 +945,13 @@ private fun StepTimingSummary(stepTimings: List<StepTiming>) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.primary
             )
+            if (breakdownSummary.isNotBlank()) {
+                Text(
+                    text = breakdownSummary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+            }
             if (presentation.subtitle.isNotBlank()) {
                 Text(
                     text = presentation.subtitle,

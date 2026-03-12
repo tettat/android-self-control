@@ -2,6 +2,7 @@ package com.control.app.agent
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
@@ -53,6 +54,16 @@ class AgentEngine(
     companion object {
         private const val TAG = "AgentEngine"
         private const val ACTION_SETTLE_DELAY_MS = 500L
+        private const val WAIT_DEFAULT_DURATION_MS = 400
+        private const val WAIT_MIN_DURATION_MS = 150
+        private const val WAIT_MAX_DURATION_MS = 5_000
+        private const val MODEL_IMAGE_DETAIL_DEFAULT = "low"
+        private const val MODEL_IMAGE_DETAIL_ZOOM = "high"
+        private const val MODEL_IMAGE_JPEG_QUALITY = 52
+        private const val MODEL_ZOOM_IMAGE_JPEG_QUALITY = 64
+        private const val MAX_TOOL_CALLS_PER_STEP = 3
+        private const val UI_DUMP_FAILURES_BEFORE_COOLDOWN = 2
+        private const val UI_DUMP_COOLDOWN_CAPTURES = 5
         /** Compress history when message count exceeds this threshold. */
         private const val MAX_MESSAGES_BEFORE_COMPRESSION = 30
         /** Number of recent messages to keep verbatim during compression. */
@@ -91,12 +102,19 @@ class AgentEngine(
      */
     private var currentZoomRect: android.graphics.RectF? = null
 
+    /** How many upcoming captures should skip uiautomator dump after repeated failures. */
+    private var uiDumpCooldownRemaining = 0
+
+    /** Count consecutive uiautomator dump failures within the current task. */
+    private var uiDumpFailureStreak = 0
+
     private fun setProgress(
         currentRound: Int = _agentState.value.currentRound,
         statusMessage: String = _agentState.value.statusMessage,
         activeTool: String = _agentState.value.activeTool,
         lastThinking: String = _agentState.value.lastThinking,
-        lastAction: String = _agentState.value.lastAction
+        lastAction: String = _agentState.value.lastAction,
+        phaseTiming: TimingBreakdown? = null
     ) {
         val prev = _agentState.value
         val now = System.currentTimeMillis()
@@ -109,6 +127,11 @@ class AgentEngine(
             lastAction = lastAction,
             phaseStartedAtMs = if (statusChanged) now else prev.phaseStartedAtMs,
             stepTimings = if (statusChanged) finalizeCurrentStep(prev, now) else prev.stepTimings,
+            currentPhaseTiming = when {
+                statusChanged -> phaseTiming ?: TimingBreakdown()
+                phaseTiming != null -> prev.currentPhaseTiming.merge(phaseTiming)
+                else -> prev.currentPhaseTiming
+            },
             lastProgressAtMs = now
         )
     }
@@ -132,7 +155,8 @@ class AgentEngine(
             tool = state.activeTool,
             startedAtMs = state.phaseStartedAtMs,
             finishedAtMs = endTimeMs,
-            durationMs = durationMs
+            durationMs = durationMs,
+            breakdown = state.currentPhaseTiming
         )
     }
 
@@ -158,6 +182,10 @@ class AgentEngine(
             val seconds = totalSeconds % 60
             if (minutes > 0) "${minutes}m${seconds}s" else "${seconds}s"
         }
+    }
+
+    private fun formatTimingBreakdown(breakdown: TimingBreakdown): String {
+        return ExecutionLogFormatter.formatTimingBreakdown(breakdown)
     }
 
     fun addLog(entry: DebugLogEntry) {
@@ -215,6 +243,8 @@ class AgentEngine(
         val startTime = System.currentTimeMillis()
         var finalStepTimings: List<StepTiming> = emptyList()
 
+        resetCaptureStateForNewTask()
+
         _agentState.value = AgentState(
             isRunning = true,
             currentRound = 0,
@@ -254,16 +284,29 @@ class AgentEngine(
                 lastAction = "准备初始截图与界面树"
             )
 
-            val (imageBase64, screenshotWidth, screenshotHeight, uiTree) = captureScreen(settings.screenshotScale)
+            val initialCapture = captureScreen(settings.screenshotScale)
+            setProgress(phaseTiming = initialCapture.timing)
+
+            val imageBase64 = initialCapture.imageBase64
+            val screenshotWidth = initialCapture.screenshotWidth
+            val screenshotHeight = initialCapture.screenshotHeight
+            val uiTree = initialCapture.uiTree
 
             val gridImage = drawZoneGrid(imageBase64)
+            val initialCaptureTimingSummary = formatTimingBreakdown(initialCapture.timing)
 
             addLog(
                 DebugLogEntry(
                     type = DebugLogType.SCREENSHOT,
                     title = "初始截图",
-                    content = "截图: ${screenshotWidth}x${screenshotHeight}" +
-                        if (uiTree != null) ", ${currentElementMap.size}个可交互元素" else ", 控件树不可用",
+                    content = buildString {
+                        append("截图: ${screenshotWidth}x${screenshotHeight}")
+                        append(if (uiTree != null) ", ${currentElementMap.size}个可交互元素" else ", 控件树不可用")
+                        if (initialCaptureTimingSummary.isNotBlank()) {
+                            appendLine()
+                            append("耗时拆分: $initialCaptureTimingSummary")
+                        }
+                    },
                     imageBase64 = gridImage
                 )
             )
@@ -328,12 +371,21 @@ class AgentEngine(
                     }
                 )
 
-                val result = apiResult.getOrElse { e ->
+                val apiCall = apiResult.getOrElse { e ->
                     val errMsg = "API 调用失败: ${e.message}"
                     addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "API 错误", content = errMsg))
                     Log.e(TAG, errMsg, e)
                     throw RuntimeException(errMsg, e)
                 }
+                val apiTiming = TimingBreakdown(
+                    uploadMs = apiCall.timing.uploadMs,
+                    modelMs = apiCall.timing.modelMs
+                )
+                val apiTimingSummary = formatTimingBreakdown(apiTiming)
+                setProgress(
+                    phaseTiming = apiTiming
+                )
+                val result = apiCall.result
 
                 when (result) {
                     is AIChatResult.TextResponse -> {
@@ -344,7 +396,13 @@ class AgentEngine(
                             DebugLogEntry(
                                 type = DebugLogType.API_RESPONSE,
                                 title = "AI 文本响应 (第${step}步)",
-                                content = result.content
+                                content = buildString {
+                                    append(result.content)
+                                    if (apiTimingSummary.isNotBlank()) {
+                                        appendLine()
+                                        append("耗时拆分: $apiTimingSummary")
+                                    }
+                                }
                             )
                         )
 
@@ -362,7 +420,12 @@ class AgentEngine(
                         // Add assistant's message (with tool_calls) to history
                         messageHistory.add(result.rawMessage)
 
+                        val toolExecutionPlan = planToolExecution(result.toolCalls)
                         val toolNames = result.toolCalls.map { it.functionName }
+                        val executableToolNames = toolExecutionPlan
+                            .filter { it.shouldExecute }
+                            .map { it.toolCall.functionName }
+                        val skippedToolCalls = toolExecutionPlan.filterNot { it.shouldExecute }
                         addLog(
                             DebugLogEntry(
                                 type = DebugLogType.API_RESPONSE,
@@ -372,6 +435,16 @@ class AgentEngine(
                                     for (tc in result.toolCalls) {
                                         appendLine("  ${tc.functionName}(${tc.arguments})")
                                     }
+                                    if (skippedToolCalls.isNotEmpty()) {
+                                        appendLine()
+                                        appendLine("批量执行裁剪:")
+                                        skippedToolCalls.forEach { skipped ->
+                                            appendLine("  跳过 ${skipped.toolCall.functionName}: ${skipped.skipReason}")
+                                        }
+                                    }
+                                    if (apiTimingSummary.isNotBlank()) {
+                                        append("耗时拆分: $apiTimingSummary")
+                                    }
                                 }
                             )
                         )
@@ -379,9 +452,9 @@ class AgentEngine(
                         Log.d(TAG, "AI requested tools: $toolNames")
 
                         setProgress(
-                            statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolNames.first()}...",
-                            activeTool = toolNames.first(),
-                            lastAction = "AI 规划了 ${toolNames.size} 个动作"
+                            statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${executableToolNames.firstOrNull().orEmpty()}...",
+                            activeTool = executableToolNames.firstOrNull().orEmpty(),
+                            lastAction = "AI 规划了 ${toolNames.size} 个动作，本轮执行 ${executableToolNames.size} 个"
                         )
 
                         var taskCompleted = false
@@ -389,7 +462,18 @@ class AgentEngine(
                         var zoomImageOverride: String? = null
 
                         // Execute each tool call and add results to history
-                        for (toolCall in result.toolCalls) {
+                        for (plannedTool in toolExecutionPlan) {
+                            val toolCall = plannedTool.toolCall
+                            if (!plannedTool.shouldExecute) {
+                                messageHistory.add(
+                                    buildToolResultMessage(
+                                        toolCall.id,
+                                        "SKIPPED: ${plannedTool.skipReason}"
+                                    )
+                                )
+                                continue
+                            }
+                            var toolStartedAt = 0L
                             try {
                                 setProgress(
                                     statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolCall.functionName}...",
@@ -409,7 +493,9 @@ class AgentEngine(
                                     delay(50)
                                 }
 
+                                toolStartedAt = System.currentTimeMillis()
                                 val toolResult = executeToolCall(toolCall)
+                                val toolMs = (System.currentTimeMillis() - toolStartedAt).coerceAtLeast(0L)
 
                                 if (isInteractive) {
                                     _overlayVisible.value = true
@@ -425,6 +511,7 @@ class AgentEngine(
                                         content = buildString {
                                             appendLine("参数: ${toolCall.arguments}")
                                             appendLine("结果: ${toolResult.take(200)}")
+                                            append("耗时拆分: tool_ms=${toolMs}ms")
                                         }
                                     )
                                 )
@@ -432,7 +519,8 @@ class AgentEngine(
                                 Log.d(TAG, "Tool ${toolCall.functionName} done: ${toolResult.take(80)}")
                                 setProgress(
                                     activeTool = toolCall.functionName,
-                                    lastAction = "${toolCall.functionName}: ${toolResult.take(80)}"
+                                    lastAction = "${toolCall.functionName}: ${toolResult.take(80)}",
+                                    phaseTiming = TimingBreakdown(toolMs = toolMs)
                                 )
 
                                 // Check if this was the "complete" tool
@@ -457,6 +545,11 @@ class AgentEngine(
                                 throw e
                             } catch (e: Exception) {
                                 _overlayVisible.value = true
+                                val toolMs = if (toolStartedAt > 0L) {
+                                    (System.currentTimeMillis() - toolStartedAt).coerceAtLeast(0L)
+                                } else {
+                                    0L
+                                }
 
                                 val errMsg = "工具执行失败 [${toolCall.functionName}]: ${e.message}"
                                 messageHistory.add(buildToolResultMessage(toolCall.id, "ERROR: $errMsg"))
@@ -465,10 +558,19 @@ class AgentEngine(
                                     DebugLogEntry(
                                         type = DebugLogType.ERROR,
                                         title = "工具失败: ${toolCall.functionName}",
-                                        content = errMsg
+                                        content = if (toolMs > 0L) {
+                                            "$errMsg\n耗时拆分: tool_ms=${toolMs}ms"
+                                        } else {
+                                            errMsg
+                                        }
                                     )
                                 )
                                 Log.e(TAG, errMsg, e)
+                                setProgress(
+                                    activeTool = toolCall.functionName,
+                                    lastAction = errMsg.take(120),
+                                    phaseTiming = TimingBreakdown(toolMs = toolMs)
+                                )
                                 setProgress(
                                     statusMessage = "第 ${step}/${settings.maxRounds} 步: ${toolCall.functionName} 失败",
                                     activeTool = toolCall.functionName,
@@ -482,17 +584,22 @@ class AgentEngine(
                             break
                         }
 
-                        // Strip images from all previous user messages to save tokens
-                        stripImagesFromHistory(messageHistory)
+                        val shouldCaptureFreshScreen = shouldCaptureAfterToolCalls(
+                            toolExecutionPlan.filter { it.shouldExecute }.map { it.toolCall }
+                        )
+                        if (zoomImageOverride != null || shouldCaptureFreshScreen) {
+                            stripImagesFromHistory(messageHistory)
+                        }
 
                         if (zoomImageOverride != null) {
                             // zoom_region was called: send the zoomed image instead of taking a new screenshot
                             val zoomMsg = buildUserMessageWithImage(
                                 "已放大到指定区域，请查看上图。继续选择子区域放大(zoom_region)或点击(tap_region)。区域编号: 第1行123，第2行456，第3行789。",
-                                zoomImageOverride!!
+                                zoomImageOverride!!,
+                                detail = MODEL_IMAGE_DETAIL_ZOOM
                             )
                             messageHistory.add(zoomMsg)
-                        } else {
+                        } else if (shouldCaptureFreshScreen) {
                             // Reset zoom state for fresh screenshot
                             currentZoomRect = null
 
@@ -504,15 +611,28 @@ class AgentEngine(
                                 lastAction = "动作执行完成，刷新界面"
                             )
 
-                            val (newImageBase64, newWidth, newHeight, newUiTree) = captureScreen(settings.screenshotScale)
+                            val followUpCapture = captureScreen(settings.screenshotScale)
+                            setProgress(phaseTiming = followUpCapture.timing)
+
+                            val newImageBase64 = followUpCapture.imageBase64
+                            val newWidth = followUpCapture.screenshotWidth
+                            val newHeight = followUpCapture.screenshotHeight
+                            val newUiTree = followUpCapture.uiTree
                             val gridFollowUp = drawZoneGrid(newImageBase64)
+                            val followUpTimingSummary = formatTimingBreakdown(followUpCapture.timing)
 
                             addLog(
                                 DebugLogEntry(
                                     type = DebugLogType.SCREENSHOT,
                                     title = "截图 (第${step}步后)",
-                                    content = "截图: ${newWidth}x${newHeight}" +
-                                        if (newUiTree != null) ", ${currentElementMap.size}个可交互元素" else ", 控件树不可用",
+                                    content = buildString {
+                                        append("截图: ${newWidth}x${newHeight}")
+                                        append(if (newUiTree != null) ", ${currentElementMap.size}个可交互元素" else ", 控件树不可用")
+                                        if (followUpTimingSummary.isNotBlank()) {
+                                            appendLine()
+                                            append("耗时拆分: $followUpTimingSummary")
+                                        }
+                                    },
                                     imageBase64 = gridFollowUp
                                 )
                             )
@@ -525,6 +645,19 @@ class AgentEngine(
 
                             val followUpMessage = buildUserMessageWithImage(followUpPrompt, gridFollowUp)
                             messageHistory.add(followUpMessage)
+                        } else {
+                            addLog(
+                                DebugLogEntry(
+                                    type = DebugLogType.INFO,
+                                    title = "跳过截图",
+                                    content = "刚才执行的工具不会直接改变界面，复用上一张截图继续推理"
+                                )
+                            )
+                            messageHistory.add(
+                                buildTextOnlyUserMessage(
+                                    "没有新的屏幕截图。刚才执行的工具不会直接改变界面，请结合最近一次截图和最新工具结果继续。"
+                                )
+                            )
                         }
 
                         // Compress conversation history if it has grown too long
@@ -726,7 +859,8 @@ class AgentEngine(
         val imageBase64: String,
         val screenshotWidth: Int,
         val screenshotHeight: Int,
-        val uiTree: String?
+        val uiTree: String?,
+        val timing: TimingBreakdown
     )
 
     private suspend fun captureScreen(screenshotScale: Float): ScreenCapture {
@@ -735,17 +869,42 @@ class AgentEngine(
         delay(150)
 
         // Take screenshot
+        val screenshotStartedAt = System.currentTimeMillis()
         val screenshotResult = adbExecutor.takeScreenshot(screenshotScale)
+        val screenshotMs = (System.currentTimeMillis() - screenshotStartedAt).coerceAtLeast(0L)
 
         // Dump UI hierarchy while overlay is still hidden
         currentElementMap = emptyMap()
-        val uiTreeResult = try {
-            val rawXml = adbExecutor.dumpUiHierarchy().getOrNull()
-            if (rawXml != null) simplifyUiTree(rawXml) else null
-        } catch (e: Exception) {
-            Log.w(TAG, "UI tree dump failed: ${e.message}")
+        val uiDumpStartedAt = System.currentTimeMillis()
+        val uiTreeResult = if (uiDumpCooldownRemaining > 0) {
+            uiDumpCooldownRemaining--
+            Log.d(TAG, "Skipping UI dump due to cooldown, remaining=$uiDumpCooldownRemaining")
             null
+        } else {
+            try {
+                adbExecutor.dumpUiHierarchy().fold(
+                    onSuccess = { rawXml ->
+                        if (rawXml.isBlank()) {
+                            registerUiDumpFailure("uiautomator dump returned empty XML")
+                            null
+                        } else {
+                            uiDumpFailureStreak = 0
+                            simplifyUiTree(rawXml)
+                        }
+                    },
+                    onFailure = { error ->
+                        registerUiDumpFailure(error.message ?: "unknown error")
+                        Log.w(TAG, "UI tree dump failed: ${error.message}")
+                        null
+                    }
+                )
+            } catch (e: Exception) {
+                registerUiDumpFailure(e.message ?: "unknown error")
+                Log.w(TAG, "UI tree dump failed: ${e.message}")
+                null
+            }
         }
+        val uiDumpMs = (System.currentTimeMillis() - uiDumpStartedAt).coerceAtLeast(0L)
         val uiTree = uiTreeResult?.text
         if (uiTreeResult != null) {
             currentElementMap = uiTreeResult.elementMap
@@ -769,7 +928,9 @@ class AgentEngine(
         }
 
         // Encode screenshot to base64
+        val encodeStartedAt = System.currentTimeMillis()
         val imageBase64 = bitmapToBase64(screenshot)
+        val encodeMs = (System.currentTimeMillis() - encodeStartedAt).coerceAtLeast(0L)
         val screenshotWidth = screenshot.width
         val screenshotHeight = screenshot.height
         screenshot.recycle()
@@ -780,7 +941,17 @@ class AgentEngine(
         // Save for tap annotation overlay
         lastScreenshotBase64 = imageBase64
 
-        return ScreenCapture(imageBase64, screenshotWidth, screenshotHeight, uiTree)
+        return ScreenCapture(
+            imageBase64 = imageBase64,
+            screenshotWidth = screenshotWidth,
+            screenshotHeight = screenshotHeight,
+            uiTree = uiTree,
+            timing = TimingBreakdown(
+                screenshotMs = screenshotMs,
+                uiDumpMs = uiDumpMs,
+                encodeMs = encodeMs
+            )
+        )
     }
 
     /**
@@ -1024,7 +1195,8 @@ class AgentEngine(
             }
 
             "wait" -> {
-                val ms = args["duration"]?.jsonPrimitive?.intOrNull ?: 1000
+                val ms = (args["duration"]?.jsonPrimitive?.intOrNull ?: WAIT_DEFAULT_DURATION_MS)
+                    .coerceIn(WAIT_MIN_DURATION_MS, WAIT_MAX_DURATION_MS)
                 delay(ms.toLong())
                 "Waited ${ms}ms"
             }
@@ -1091,10 +1263,22 @@ class AgentEngine(
         }
     }
 
+    private fun buildTextOnlyUserMessage(text: String): JsonObject {
+        return buildJsonObject {
+            put("role", "user")
+            put("content", text)
+        }
+    }
+
     /**
      * Build a user message with an image attachment.
      */
-    private fun buildUserMessageWithImage(text: String, imageBase64: String): JsonObject {
+    private fun buildUserMessageWithImage(
+        text: String,
+        imageBase64: String,
+        detail: String = MODEL_IMAGE_DETAIL_DEFAULT
+    ): JsonObject {
+        val modelImage = prepareImageForModel(imageBase64, detail)
         return buildJsonObject {
             put("role", "user")
             put("content", buildJsonArray {
@@ -1105,8 +1289,8 @@ class AgentEngine(
                 add(buildJsonObject {
                     put("type", "image_url")
                     put("image_url", buildJsonObject {
-                        put("url", "data:image/png;base64,$imageBase64")
-                        put("detail", "high")
+                        put("url", "data:${modelImage.mimeType};base64,${modelImage.base64}")
+                        put("detail", detail)
                     })
                 })
             })
@@ -1154,6 +1338,121 @@ class AgentEngine(
 
     fun setCurrentJob(job: Job) {
         currentJob = job
+    }
+
+    private fun resetCaptureStateForNewTask() {
+        currentElementMap = emptyMap()
+        currentScreenshotScale = 1.0f
+        lastScreenshotBase64 = null
+        currentZoomRect = null
+        uiDumpCooldownRemaining = 0
+        uiDumpFailureStreak = 0
+    }
+
+    private data class PlannedToolExecution(
+        val toolCall: ToolCall,
+        val shouldExecute: Boolean,
+        val skipReason: String = ""
+    )
+
+    private fun planToolExecution(toolCalls: List<ToolCall>): List<PlannedToolExecution> {
+        if (toolCalls.isEmpty()) return emptyList()
+
+        val firstZoomToolId = toolCalls.firstOrNull { it.functionName == "zoom_region" }?.id
+        val planned = mutableListOf<PlannedToolExecution>()
+        var executedCount = 0
+        var seenComplete = false
+
+        for (toolCall in toolCalls) {
+            val skipReason = when {
+                firstZoomToolId != null && toolCall.id != firstZoomToolId ->
+                    "zoom_region 需要单独执行，放大后必须先观察新截图"
+
+                seenComplete ->
+                    "complete 必须是本轮最后一个工具"
+
+                executedCount >= MAX_TOOL_CALLS_PER_STEP ->
+                    "单轮最多连续执行 $MAX_TOOL_CALLS_PER_STEP 个工具，请根据最新结果继续规划"
+
+                else -> ""
+            }
+
+            if (skipReason.isNotBlank()) {
+                planned += PlannedToolExecution(
+                    toolCall = toolCall,
+                    shouldExecute = false,
+                    skipReason = skipReason
+                )
+                continue
+            }
+
+            planned += PlannedToolExecution(toolCall = toolCall, shouldExecute = true)
+            executedCount++
+            if (toolCall.functionName == "complete") {
+                seenComplete = true
+            }
+        }
+
+        return planned
+    }
+
+    private fun shouldCaptureAfterToolCalls(toolCalls: List<ToolCall>): Boolean {
+        return toolCalls.any { toolCall ->
+            when (toolCall.functionName) {
+                "zoom_region",
+                "load_skills",
+                "save_skill",
+                "detect_current_app",
+                "complete" -> false
+
+                else -> true
+            }
+        }
+    }
+
+    private fun registerUiDumpFailure(reason: String) {
+        uiDumpFailureStreak++
+        if (uiDumpFailureStreak < UI_DUMP_FAILURES_BEFORE_COOLDOWN) return
+
+        uiDumpFailureStreak = 0
+        uiDumpCooldownRemaining = UI_DUMP_COOLDOWN_CAPTURES
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.INFO,
+                title = "控件树降级",
+                content = "控件树连续抓取失败，接下来 $UI_DUMP_COOLDOWN_CAPTURES 次截图将跳过界面树抓取。最近错误: $reason"
+            )
+        )
+    }
+
+    private data class ModelImagePayload(
+        val base64: String,
+        val mimeType: String
+    )
+
+    private fun prepareImageForModel(imageBase64: String, detail: String): ModelImagePayload {
+        val bytes = runCatching { Base64.decode(imageBase64, Base64.NO_WRAP) }.getOrNull()
+            ?: return ModelImagePayload(imageBase64, "image/png")
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            ?: return ModelImagePayload(imageBase64, "image/png")
+        val quality = if (detail == MODEL_IMAGE_DETAIL_ZOOM) {
+            MODEL_ZOOM_IMAGE_JPEG_QUALITY
+        } else {
+            MODEL_IMAGE_JPEG_QUALITY
+        }
+
+        return try {
+            ModelImagePayload(
+                base64 = bitmapToBase64(
+                    bitmap = bitmap,
+                    format = Bitmap.CompressFormat.JPEG,
+                    quality = quality
+                ),
+                mimeType = "image/jpeg"
+            )
+        } finally {
+            bitmap.recycle()
+        }
     }
 
     /**
@@ -1340,9 +1639,13 @@ class AgentEngine(
         return Pair(centerX, centerY)
     }
 
-    private fun bitmapToBase64(bitmap: Bitmap): String {
+    private fun bitmapToBase64(
+        bitmap: Bitmap,
+        format: Bitmap.CompressFormat = Bitmap.CompressFormat.PNG,
+        quality: Int = 100
+    ): String {
         val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+        bitmap.compress(format, quality, outputStream)
         val bytes = outputStream.toByteArray()
         return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }

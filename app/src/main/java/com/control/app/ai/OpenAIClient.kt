@@ -19,6 +19,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.EventListener
 import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -31,6 +32,17 @@ import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
 class OpenAIClient {
+
+    data class RequestTiming(
+        val totalMs: Long,
+        val uploadMs: Long? = null,
+        val modelMs: Long? = null
+    )
+
+    data class ToolChatResponse(
+        val result: AIChatResult,
+        val timing: RequestTiming
+    )
 
     data class HttpLogEntry(
         val title: String,
@@ -49,6 +61,76 @@ class OpenAIClient {
             pattern = "^data:(image/[^;]+);base64,(.+)$",
             options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
         )
+    }
+
+    private data class ExecutedRequest(
+        val body: String,
+        val timing: RequestTiming
+    )
+
+    private class CallTimingCollector : EventListener() {
+        private var callStartNs: Long? = null
+        private var requestBodyStartNs: Long? = null
+        private var requestBodyEndNs: Long? = null
+        private var responseHeadersStartNs: Long? = null
+        private var responseBodyEndNs: Long? = null
+        private var callEndNs: Long? = null
+
+        override fun callStart(call: Call) {
+            callStartNs = System.nanoTime()
+        }
+
+        override fun requestBodyStart(call: Call) {
+            requestBodyStartNs = System.nanoTime()
+        }
+
+        override fun requestBodyEnd(call: Call, byteCount: Long) {
+            if (requestBodyStartNs == null) {
+                requestBodyStartNs = callStartNs
+            }
+            requestBodyEndNs = System.nanoTime()
+        }
+
+        override fun responseHeadersStart(call: Call) {
+            responseHeadersStartNs = System.nanoTime()
+        }
+
+        override fun responseBodyEnd(call: Call, byteCount: Long) {
+            responseBodyEndNs = System.nanoTime()
+        }
+
+        override fun callEnd(call: Call) {
+            callEndNs = System.nanoTime()
+        }
+
+        override fun callFailed(call: Call, ioe: IOException) {
+            callEndNs = System.nanoTime()
+        }
+
+        fun snapshot(): RequestTiming {
+            val totalMs = durationMs(
+                startNs = callStartNs ?: requestBodyStartNs ?: responseHeadersStartNs,
+                endNs = callEndNs ?: responseBodyEndNs ?: responseHeadersStartNs ?: requestBodyEndNs
+            ) ?: 0L
+            val uploadMs = durationMs(
+                startNs = requestBodyStartNs ?: callStartNs,
+                endNs = requestBodyEndNs
+            )
+            val modelMs = durationMs(
+                startNs = requestBodyEndNs ?: requestBodyStartNs ?: callStartNs,
+                endNs = responseHeadersStartNs
+            )
+            return RequestTiming(
+                totalMs = totalMs,
+                uploadMs = uploadMs,
+                modelMs = modelMs
+            )
+        }
+
+        private fun durationMs(startNs: Long?, endNs: Long?): Long? {
+            if (startNs == null || endNs == null) return null
+            return TimeUnit.NANOSECONDS.toMillis((endNs - startNs).coerceAtLeast(0L))
+        }
     }
 
     private val json = Json {
@@ -75,7 +157,7 @@ class OpenAIClient {
         apiKey: String,
         modelName: String,
         logHttp: ((HttpLogEntry) -> Unit)? = null
-    ): Result<AIChatResult> = withContext(Dispatchers.IO) {
+    ): Result<ToolChatResponse> = withContext(Dispatchers.IO) {
         runCatching {
             val requestBody = buildToolRequestBody(modelName, messages, tools)
             val requestJson = json.encodeToString(requestBody)
@@ -95,8 +177,11 @@ class OpenAIClient {
 
             logHttp?.invoke(buildRequestLog(request, requestJson))
 
-            val responseBody = executeRequest(request, logHttp)
-            parseToolResponse(responseBody)
+            val response = executeRequest(request, logHttp)
+            ToolChatResponse(
+                result = parseToolResponse(response.body),
+                timing = response.timing
+            )
         }
     }
 
@@ -211,9 +296,13 @@ class OpenAIClient {
     private suspend fun executeRequest(
         request: Request,
         logHttp: ((HttpLogEntry) -> Unit)?
-    ): String {
+    ): ExecutedRequest {
         return suspendCancellableCoroutine { continuation ->
-            val call = httpClient.newCall(request)
+            val timingCollector = CallTimingCollector()
+            val call = httpClient.newBuilder()
+                .eventListener(timingCollector)
+                .build()
+                .newCall(request)
 
             continuation.invokeOnCancellation {
                 call.cancel()
@@ -221,6 +310,7 @@ class OpenAIClient {
 
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
+                    val timing = timingCollector.snapshot()
                     logHttp?.invoke(
                         HttpLogEntry(
                             title = "AI 请求失败",
@@ -228,6 +318,9 @@ class OpenAIClient {
                                 appendLine("Method: ${request.method}")
                                 appendLine("URL: ${request.url}")
                                 appendLine("Error: ${e.message}")
+                                appendLine("total_ms: ${timing.totalMs}")
+                                timing.uploadMs?.let { appendLine("upload_ms: $it") }
+                                timing.modelMs?.let { appendLine("model_ms: $it") }
                             }.trimEnd()
                         )
                     )
@@ -241,10 +334,11 @@ class OpenAIClient {
                 override fun onResponse(call: Call, response: Response) {
                     try {
                         val body = response.body?.string() ?: ""
+                        val timing = timingCollector.snapshot()
                         logHttp?.invoke(
                             HttpLogEntry(
                                 title = "AI 响应详情",
-                                content = buildResponseLog(response, body)
+                                content = buildResponseLog(response, body, timing)
                             )
                         )
 
@@ -261,7 +355,7 @@ class OpenAIClient {
                             return
                         }
 
-                        continuation.resume(body)
+                        continuation.resume(ExecutedRequest(body = body, timing = timing))
                     } catch (e: Exception) {
                         continuation.resumeWithException(
                             RuntimeException("Failed to read response: ${e.message}", e)
@@ -304,9 +398,17 @@ class OpenAIClient {
         )
     }
 
-    private fun buildResponseLog(response: Response, body: String): String = buildString {
+    private fun buildResponseLog(
+        response: Response,
+        body: String,
+        timing: RequestTiming
+    ): String = buildString {
         appendLine("Status: ${response.code} ${response.message}")
         appendLine("URL: ${response.request.url}")
+        appendLine("Timings:")
+        appendLine("  total_ms: ${timing.totalMs}")
+        timing.uploadMs?.let { appendLine("  upload_ms: $it") }
+        timing.modelMs?.let { appendLine("  model_ms: $it") }
         appendLine("Headers:")
         appendLine(formatHeaders(response.headers))
         appendLine("Body:")
@@ -448,7 +550,7 @@ class OpenAIClient {
                 .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
-            val responseBody = executeRequest(request, null)
+            val responseBody = executeRequest(request, null).body
             val chatResponse = json.decodeFromString<ChatResponse>(responseBody)
             chatResponse.choices.firstOrNull()?.message?.content ?: ""
         }

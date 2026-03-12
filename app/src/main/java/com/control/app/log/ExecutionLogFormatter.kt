@@ -6,6 +6,7 @@ import com.control.app.agent.AgentState
 import com.control.app.agent.DebugLogEntry
 import com.control.app.agent.Session
 import com.control.app.agent.StepTiming
+import com.control.app.agent.TimingBreakdown
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -75,6 +76,7 @@ object ExecutionLogFormatter {
             put("phaseStartedAt", formatTimestamp(agentState.phaseStartedAtMs))
             put("lastProgressAtMs", agentState.lastProgressAtMs)
             put("lastProgressAt", formatTimestamp(agentState.lastProgressAtMs))
+            put("currentPhaseTiming", buildTimingBreakdownJson(agentState.currentPhaseTiming))
             put("stepTimings", buildStepTimingsJson(agentState.stepTimings))
         }
 
@@ -155,9 +157,27 @@ object ExecutionLogFormatter {
                         put("finishedAt", formatTimestamp(step.finishedAtMs))
                         put("durationMs", step.durationMs)
                         put("duration", formatDurationMs(step.durationMs))
+                        put("timingBreakdown", buildTimingBreakdownJson(step.breakdown))
+                        put("screenshot_ms", step.breakdown.screenshotMs ?: JSONObject.NULL)
+                        put("ui_dump_ms", step.breakdown.uiDumpMs ?: JSONObject.NULL)
+                        put("encode_ms", step.breakdown.encodeMs ?: JSONObject.NULL)
+                        put("upload_ms", step.breakdown.uploadMs ?: JSONObject.NULL)
+                        put("model_ms", step.breakdown.modelMs ?: JSONObject.NULL)
+                        put("tool_ms", step.breakdown.toolMs ?: JSONObject.NULL)
+                        put("timingBreakdownSummary", formatTimingBreakdown(step.breakdown))
                     }
                 )
             }
+        }
+
+    fun buildTimingBreakdownJson(breakdown: TimingBreakdown): JSONObject =
+        JSONObject().apply {
+            put("screenshot_ms", breakdown.screenshotMs ?: JSONObject.NULL)
+            put("ui_dump_ms", breakdown.uiDumpMs ?: JSONObject.NULL)
+            put("encode_ms", breakdown.encodeMs ?: JSONObject.NULL)
+            put("upload_ms", breakdown.uploadMs ?: JSONObject.NULL)
+            put("model_ms", breakdown.modelMs ?: JSONObject.NULL)
+            put("tool_ms", breakdown.toolMs ?: JSONObject.NULL)
         }
 
     fun buildExportTime(): String =
@@ -178,6 +198,18 @@ object ExecutionLogFormatter {
             val seconds = totalSeconds % 60
             if (minutes > 0) "${minutes}m${seconds}s" else "${seconds}s"
         }
+    }
+
+    fun formatTimingBreakdown(breakdown: TimingBreakdown): String {
+        val parts = buildList {
+            breakdown.screenshotMs?.let { add("screenshot_ms=${formatDurationMs(it)}") }
+            breakdown.uiDumpMs?.let { add("ui_dump_ms=${formatDurationMs(it)}") }
+            breakdown.encodeMs?.let { add("encode_ms=${formatDurationMs(it)}") }
+            breakdown.uploadMs?.let { add("upload_ms=${formatDurationMs(it)}") }
+            breakdown.modelMs?.let { add("model_ms=${formatDurationMs(it)}") }
+            breakdown.toolMs?.let { add("tool_ms=${formatDurationMs(it)}") }
+        }
+        return parts.joinToString(", ")
     }
 
     fun describeStepTiming(step: StepTiming): StepTimingPresentation {
@@ -263,6 +295,11 @@ object ExecutionLogFormatter {
             append(presentation.title)
             append(" | 耗时 ")
             append(formatDurationMs(step.durationMs))
+            val breakdownSummary = formatTimingBreakdown(step.breakdown)
+            if (breakdownSummary.isNotBlank()) {
+                append(" | ")
+                append(breakdownSummary)
+            }
             if (presentation.subtitle.isNotBlank()) {
                 append(" | ")
                 append(presentation.subtitle)

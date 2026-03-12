@@ -245,12 +245,12 @@ object ToolDefinitions {
 
         add(buildTool(
             name = "wait",
-            description = "等待指定时间，让页面加载或动画完成。",
+            description = "等待指定时间，让页面加载或动画完成。请按场景自适应选择时长，优先使用够用的最短等待；轻量点击/弹层通常 200-400ms，页面切换通常 400-800ms，只有启动 App 或明显重加载时才建议 1000ms 以上。",
             required = emptyList(),
             properties = {
                 put("duration", buildJsonObject {
                     put("type", "integer")
-                    put("description", "等待时长（毫秒），默认1000")
+                    put("description", "等待时长（毫秒）。建议按场景自适应：轻量 UI 200-400，页面切换 400-800，App 启动/重加载 1000-1800；默认400")
                 })
                 put("description", buildJsonObject {
                     put("type", "string")

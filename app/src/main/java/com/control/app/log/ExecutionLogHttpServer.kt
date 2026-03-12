@@ -338,10 +338,12 @@ class ExecutionLogHttpServer(
         }
         val stepTimingItems = agentState.stepTimings.mapIndexed { index, step ->
             val presentation = ExecutionLogFormatter.describeStepTiming(step)
+            val breakdownSummary = ExecutionLogFormatter.formatTimingBreakdown(step.breakdown)
             """
                 <li>
                   <strong>${index + 1}. [${escapeHtml(presentation.category)}] ${escapeHtml(presentation.title)}</strong>
                   <div class="meta">耗时: ${escapeHtml(ExecutionLogFormatter.formatDurationMs(step.durationMs))}</div>
+                  ${if (breakdownSummary.isNotBlank()) """<div class="meta">${escapeHtml(breakdownSummary)}</div>""" else ""}
                   ${if (presentation.subtitle.isNotBlank()) """<div class="meta">${escapeHtml(presentation.subtitle)}</div>""" else ""}
                 </li>
             """.trimIndent()

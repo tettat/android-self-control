@@ -59,12 +59,39 @@ enum class DebugLogType {
     INFO
 }
 
+data class TimingBreakdown(
+    val screenshotMs: Long? = null,
+    val uiDumpMs: Long? = null,
+    val encodeMs: Long? = null,
+    val uploadMs: Long? = null,
+    val modelMs: Long? = null,
+    val toolMs: Long? = null
+) {
+    fun merge(other: TimingBreakdown): TimingBreakdown = TimingBreakdown(
+        screenshotMs = other.screenshotMs ?: screenshotMs,
+        uiDumpMs = other.uiDumpMs ?: uiDumpMs,
+        encodeMs = other.encodeMs ?: encodeMs,
+        uploadMs = other.uploadMs ?: uploadMs,
+        modelMs = other.modelMs ?: modelMs,
+        toolMs = other.toolMs ?: toolMs
+    )
+
+    fun isEmpty(): Boolean =
+        screenshotMs == null &&
+            uiDumpMs == null &&
+            encodeMs == null &&
+            uploadMs == null &&
+            modelMs == null &&
+            toolMs == null
+}
+
 data class StepTiming(
     val label: String,
     val tool: String = "",
     val startedAtMs: Long,
     val finishedAtMs: Long,
-    val durationMs: Long
+    val durationMs: Long,
+    val breakdown: TimingBreakdown = TimingBreakdown()
 )
 
 data class AgentState(
@@ -79,5 +106,6 @@ data class AgentState(
     val taskStartedAtMs: Long = 0L,
     val phaseStartedAtMs: Long = 0L,
     val lastProgressAtMs: Long = 0L,
+    val currentPhaseTiming: TimingBreakdown = TimingBreakdown(),
     val stepTimings: List<StepTiming> = emptyList()
 )
