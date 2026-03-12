@@ -353,12 +353,15 @@ class FloatingBubbleService : Service() {
             overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
         }
+        edgeGlowOverlay?.isClickable = false
+        edgeGlowOverlay?.isFocusable = false
 
         windowManager.addView(edgeGlowOverlay, edgeGlowOverlayParams)
     }
@@ -372,6 +375,8 @@ class FloatingBubbleService : Service() {
             maxLines = 5
             gravity = Gravity.START
             visibility = View.GONE
+            isClickable = false
+            isFocusable = false
         }
 
         val overlayType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
@@ -384,6 +389,7 @@ class FloatingBubbleService : Service() {
             overlayType,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         ).apply {
@@ -851,6 +857,8 @@ private class AutomationEdgeGlowView(
         stopPulse()
         super.onDetachedFromWindow()
     }
+
+    override fun onTouchEvent(event: MotionEvent): Boolean = false
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
