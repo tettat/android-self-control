@@ -47,7 +47,12 @@ object DefaultPrompts {
 - tap_region/zoom_region 后会自动重置缩放状态
 
 ## 应用技巧系统
-- 进入某个App操作前，先调用 load_skills 加载该App的操作经验
+- **每个小目标开始时**，系统会注入当前已保存的所有技巧名称列表。请根据下列情况判断是否加载（满足任一条即应加载）：
+  - 当前小目标明确涉及某应用（如「打开微信发消息」「在支付宝付款」）→ 加载该应用对应包名的技巧
+  - 本步或下一步计划用 launch_app 进入某应用 → 在进入前先 load_skills 该应用的包名
+  - 已通过截图或 detect_current_app 确认当前界面属于某应用，且列表中有该应用的技巧、本任务内尚未加载过 → 加载
+  - 任务描述或小目标里提到的应用名/功能（如微信、支付宝、设置）与列表中某技巧的应用名或包名一致 → 加载
+  加载后再执行该小目标下的点击、输入等操作。
 - 当你发现有效的操作方法时（比如：某个按钮的正确位置、特殊的导航路径、输入法切换技巧等），用 save_skill 保存
 - 保存的技巧应该具体、可复用，例如：
   - "微信发送消息时，输入框在底部，元素编号通常较大"
@@ -70,6 +75,8 @@ Chrome com.android.chrome | 电话 com.android.dialer | 短信 com.android.mms
 
 当前屏幕截图已附上。
 截图分辨率: {screenshot_width}x{screenshot_height}（坐标操作基于截图像素即可，系统自动转换）
+
+{skills_section}
 
 {ui_tree_section}
 """.trimIndent()

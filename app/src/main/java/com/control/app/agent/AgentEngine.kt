@@ -268,6 +268,10 @@ class AgentEngine(
         val messageHistory = session.messageHistory
         var resultMessage = "任务完成"
         var step = 0
+        var reflectionPhaseRequested = false
+        var reflectionPromptInjected = false
+        var reflectionSummary = ""
+        val savedSkillsInReflection = mutableListOf<String>()
 
         try {
             // System message
@@ -311,12 +315,14 @@ class AgentEngine(
                 )
             )
 
-            // Build initial user message with screenshot + task
+            // Build initial user message with screenshot + task（注入已保存技巧名称供模型选择加载）
+            val skillNames = skillStore?.getAllSkills()?.map { "${it.appName} (${it.packageName})" } ?: emptyList()
             val actionPrompt = promptManager.buildActionPrompt(
                 userCommand = voiceCommand,
                 screenshotWidth = screenshotWidth,
                 screenshotHeight = screenshotHeight,
-                uiTree = uiTree
+                uiTree = uiTree,
+                skillNames = skillNames
             )
 
             val userMessage = buildUserMessageWithImage(actionPrompt, gridImage)
@@ -412,8 +418,27 @@ class AgentEngine(
                             lastAction = "AI 返回了最终文本响应"
                         )
 
-                        resultMessage = result.content.ifBlank { "任务完成" }
-                        break
+                        // In reflection phase: capture summary and ask model to call complete, then continue
+                        if (reflectionPhaseRequested && reflectionPromptInjected) {
+                            reflectionSummary = result.content
+                            messageHistory.add(
+                                buildTextOnlyUserMessage("若已反思完毕，请调用 complete 工具结束任务。")
+                            )
+                            setProgress(
+                                statusMessage = "反思中：已收到总结，请调用 complete 结束",
+                                lastAction = "等待模型调用 complete…"
+                            )
+                            addLog(
+                                DebugLogEntry(
+                                    type = DebugLogType.INFO,
+                                    title = "反思阶段",
+                                    content = "已收到反思总结，等待模型调用 complete 结束"
+                                )
+                            )
+                        } else {
+                            resultMessage = result.content.ifBlank { "任务完成" }
+                            break
+                        }
                     }
 
                     is AIChatResult.ToolCallResponse -> {
@@ -504,6 +529,10 @@ class AgentEngine(
                                 // Add tool result to history
                                 messageHistory.add(buildToolResultMessage(toolCall.id, toolResult))
 
+                                if (toolCall.functionName == "save_skill" && reflectionPromptInjected) {
+                                    savedSkillsInReflection.add(toolResult)
+                                }
+
                                 addLog(
                                     DebugLogEntry(
                                         type = DebugLogType.ACTION_EXECUTED,
@@ -525,9 +554,14 @@ class AgentEngine(
 
                                 // Check if this was the "complete" tool
                                 if (toolCall.functionName == "complete") {
-                                    taskCompleted = true
-                                    val msg = toolCall.arguments["message"]?.jsonPrimitive?.content
-                                    completionMessage = msg ?: "任务完成"
+                                    if (reflectionPhaseRequested) {
+                                        taskCompleted = true
+                                        val msg = toolCall.arguments["message"]?.jsonPrimitive?.content
+                                        completionMessage = msg ?: "任务完成"
+                                    } else {
+                                        reflectionPhaseRequested = true
+                                        // Will inject reflection prompt after this for-loop
+                                    }
                                 }
 
                                 // If zoom_region was called, capture the zoomed+grid image for override
@@ -581,9 +615,37 @@ class AgentEngine(
 
                         if (taskCompleted) {
                             resultMessage = completionMessage
+                            if (reflectionSummary.isNotBlank() || savedSkillsInReflection.isNotEmpty()) {
+                                resultMessage += "\n\n【反思】\n"
+                                if (reflectionSummary.isNotBlank()) {
+                                    resultMessage += reflectionSummary.trim() + "\n"
+                                }
+                                if (savedSkillsInReflection.isNotEmpty()) {
+                                    resultMessage += "已保存技巧：\n" + savedSkillsInReflection.joinToString("\n")
+                                }
+                            }
                             break
                         }
 
+                        if (reflectionPhaseRequested && !reflectionPromptInjected) {
+                            messageHistory.add(
+                                buildTextOnlyUserMessage(
+                                    "请进行任务结束反思：\n1) 本次执行中做对的地方\n2) 做错或可改进的地方\n3) 若有可复用经验请调用 save_skill 保存。\n完成反思后再次调用 complete 工具表示真正结束。"
+                                )
+                            )
+                            reflectionPromptInjected = true
+                            addLog(
+                                DebugLogEntry(
+                                    type = DebugLogType.INFO,
+                                    title = "反思阶段",
+                                    content = "已插入反思提示，等待模型总结并可选保存技巧"
+                                )
+                            )
+                            setProgress(
+                                statusMessage = "反思中：总结做对/做错的地方，并可选保存技巧",
+                                lastAction = "等待反思结果…"
+                            )
+                        } else {
                         val shouldCaptureFreshScreen = shouldCaptureAfterToolCalls(
                             toolExecutionPlan.filter { it.shouldExecute }.map { it.toolCall }
                         )
@@ -637,10 +699,12 @@ class AgentEngine(
                                 )
                             )
 
+                            val followUpSkillNames = skillStore?.getAllSkills()?.map { "${it.appName} (${it.packageName})" } ?: emptyList()
                             val followUpPrompt = promptManager.buildFollowUpPrompt(
                                 screenshotWidth = newWidth,
                                 screenshotHeight = newHeight,
-                                uiTree = newUiTree
+                                uiTree = newUiTree,
+                                skillNames = followUpSkillNames
                             )
 
                             val followUpMessage = buildUserMessageWithImage(followUpPrompt, gridFollowUp)
@@ -662,6 +726,7 @@ class AgentEngine(
 
                         // Compress conversation history if it has grown too long
                         compressHistoryIfNeeded(messageHistory, settings)
+                        }
                     }
                 }
             }
