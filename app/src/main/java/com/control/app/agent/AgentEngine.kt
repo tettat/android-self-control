@@ -96,7 +96,6 @@ class AgentEngine(
         private const val TOOL_SEQUENCE_CUE_FADE_MS = 650L
         private const val SWIPE_PATH_INTERMEDIATE_POINTS = 2
         private const val SWIPE_PATH_MAX_OFFSET_PX = 36f
-        private const val MAX_TOOL_CALLS_PER_STEP = 3
         private const val UI_DUMP_FAILURES_BEFORE_COOLDOWN = 2
         private const val UI_DUMP_COOLDOWN_CAPTURES = 5
         private const val MAX_UI_TREE_LINES = 150
@@ -613,27 +612,16 @@ class AgentEngine(
                         // Add assistant's message (with tool_calls) to history
                         messageHistory.add(result.rawMessage)
 
-                        val toolExecutionPlan = planToolExecution(result.toolCalls)
-                        val toolNames = result.toolCalls.map { it.functionName }
-                        val executableToolNames = toolExecutionPlan
-                            .filter { it.shouldExecute }
-                            .map { it.toolCall.functionName }
-                        val skippedToolCalls = toolExecutionPlan.filterNot { it.shouldExecute }
+                        val toolCalls = result.toolCalls
+                        val toolNames = toolCalls.map { it.functionName }
                         addLog(
                             DebugLogEntry(
                                 type = DebugLogType.API_RESPONSE,
                                 title = "AI 工具调用 (第${step}步)",
                                 content = buildString {
                                     appendLine("工具调用: ${toolNames.joinToString(", ")}")
-                                    for (tc in result.toolCalls) {
+                                    for (tc in toolCalls) {
                                         appendLine("  ${tc.functionName}(${tc.arguments})")
-                                    }
-                                    if (skippedToolCalls.isNotEmpty()) {
-                                        appendLine()
-                                        appendLine("批量执行裁剪:")
-                                        skippedToolCalls.forEach { skipped ->
-                                            appendLine("  跳过 ${skipped.toolCall.functionName}: ${skipped.skipReason}")
-                                        }
                                     }
                                     if (apiTimingSummary.isNotBlank()) {
                                         append("耗时拆分: $apiTimingSummary")
@@ -647,9 +635,9 @@ class AgentEngine(
                         val stepIntentFromAssistant = extractTextContent(result.rawMessage).trim().take(400)
 
                         setProgress(
-                            statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${executableToolNames.firstOrNull().orEmpty()}...",
-                            activeTool = executableToolNames.firstOrNull().orEmpty(),
-                            lastAction = "AI 规划了 ${toolNames.size} 个动作，本轮执行 ${executableToolNames.size} 个",
+                            statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolNames.firstOrNull().orEmpty()}...",
+                            activeTool = toolNames.firstOrNull().orEmpty(),
+                            lastAction = "AI 规划了 ${toolNames.size} 个动作，本轮顺序执行",
                             stepIntent = stepIntentFromAssistant
                         )
 
@@ -658,17 +646,7 @@ class AgentEngine(
                         var zoomImageOverride: String? = null
 
                         // Execute each tool call and add results to history
-                        for (plannedTool in toolExecutionPlan) {
-                            val toolCall = plannedTool.toolCall
-                            if (!plannedTool.shouldExecute) {
-                                messageHistory.add(
-                                    buildToolResultMessage(
-                                        toolCall.id,
-                                        "SKIPPED: ${plannedTool.skipReason}"
-                                    )
-                                )
-                                continue
-                            }
+                        for (toolCall in toolCalls) {
                             var toolStartedAt = 0L
                             try {
                                 setProgress(
@@ -785,7 +763,7 @@ class AgentEngine(
                         }
 
                         val shouldCaptureFreshScreen = shouldCaptureAfterToolCalls(
-                            toolExecutionPlan.filter { it.shouldExecute }.map { it.toolCall }
+                            toolCalls
                         )
                         if (zoomImageOverride != null || shouldCaptureFreshScreen) {
                             stripImagesFromHistory(messageHistory)
@@ -2569,58 +2547,11 @@ class AgentEngine(
         uiDumpFailureStreak = 0
     }
 
-    private data class PlannedToolExecution(
-        val toolCall: ToolCall,
-        val shouldExecute: Boolean,
-        val skipReason: String = ""
-    )
-
     private fun settleDelayForTool(toolName: String): Long {
         return when (toolName) {
             "tap_element_sequence" -> TAP_SEQUENCE_SETTLE_DELAY_MS
             else -> ACTION_SETTLE_DELAY_MS
         }
-    }
-
-    private fun planToolExecution(toolCalls: List<ToolCall>): List<PlannedToolExecution> {
-        if (toolCalls.isEmpty()) return emptyList()
-
-        val firstZoomToolId = toolCalls.firstOrNull { it.functionName == "zoom_region" }?.id
-        val planned = mutableListOf<PlannedToolExecution>()
-        var executedCount = 0
-        var seenComplete = false
-
-        for (toolCall in toolCalls) {
-            val skipReason = when {
-                firstZoomToolId != null && toolCall.id != firstZoomToolId ->
-                    "zoom_region 需要单独执行，放大后必须先观察新截图"
-
-                seenComplete ->
-                    "complete 必须是本轮最后一个工具"
-
-                executedCount >= MAX_TOOL_CALLS_PER_STEP ->
-                    "单轮最多连续执行 $MAX_TOOL_CALLS_PER_STEP 个工具，请根据最新结果继续规划"
-
-                else -> ""
-            }
-
-            if (skipReason.isNotBlank()) {
-                planned += PlannedToolExecution(
-                    toolCall = toolCall,
-                    shouldExecute = false,
-                    skipReason = skipReason
-                )
-                continue
-            }
-
-            planned += PlannedToolExecution(toolCall = toolCall, shouldExecute = true)
-            executedCount++
-            if (toolCall.functionName == "complete") {
-                seenComplete = true
-            }
-        }
-
-        return planned
     }
 
     private fun shouldCaptureAfterToolCalls(toolCalls: List<ToolCall>): Boolean {
