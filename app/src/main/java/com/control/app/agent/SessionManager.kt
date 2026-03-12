@@ -33,6 +33,8 @@ class SessionManager {
     companion object {
         private const val TAG = "SessionManager"
         private const val MAX_SESSIONS = 20
+        private const val MAX_SESSION_DEBUG_ENTRIES = 80
+        private const val MAX_SESSION_IMAGE_ENTRIES = 12
     }
 
     private val _sessions = MutableStateFlow<List<Session>>(emptyList())
@@ -54,6 +56,8 @@ class SessionManager {
             val removed = updated.drop(MAX_SESSIONS)
             for (s in removed) {
                 Log.d(TAG, "Pruning old session: ${s.id} (${s.title})")
+                s.messageHistory.clear()
+                s.debugEntries.clear()
             }
             updated.take(MAX_SESSIONS)
         } else {
@@ -125,6 +129,28 @@ class SessionManager {
     fun addEntryToCurrentSession(entry: DebugLogEntry) {
         val session = _currentSession.value ?: return
         session.debugEntries.add(entry)
+        trimSessionDebugEntries(session.debugEntries)
         session.lastActiveAt = System.currentTimeMillis()
+    }
+
+    private fun trimSessionDebugEntries(entries: MutableList<DebugLogEntry>) {
+        if (entries.size > MAX_SESSION_DEBUG_ENTRIES) {
+            val overflow = entries.size - MAX_SESSION_DEBUG_ENTRIES
+            repeat(overflow) {
+                entries.removeAt(0)
+            }
+        }
+
+        var imagesKept = 0
+        for (index in entries.lastIndex downTo 0) {
+            val entry = entries[index]
+            if (entry.images.isEmpty()) continue
+
+            if (imagesKept < MAX_SESSION_IMAGE_ENTRIES) {
+                imagesKept++
+            } else {
+                entries[index] = entry.withoutImages()
+            }
+        }
     }
 }

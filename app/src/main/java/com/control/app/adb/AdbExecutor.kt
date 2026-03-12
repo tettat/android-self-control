@@ -9,6 +9,7 @@ import android.graphics.BitmapFactory
 import android.util.Base64
 import android.util.Log
 import com.control.app.service.UiTreeAccessibilityService
+import com.control.app.util.ImageMemoryUtils
 import io.github.muntashirakon.adb.AdbStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -57,6 +58,41 @@ class AdbExecutor(private val context: Context) {
 
     @Volatile
     var lastConnectedPort: Int = 0
+
+    private enum class TextInputRoute {
+        ADB_KEYBOARD,
+        ASCII_SHELL,
+        ACCESSIBILITY,
+        CLIPBOARD
+    }
+
+    private data class TextInputCapabilities(
+        val hasAdbKeyboard: Boolean,
+        val hasAccessibilityService: Boolean
+    )
+
+    private fun String.isAsciiOnly(): Boolean = all { it.code in 0..127 }
+
+    private fun planTextInputRoutes(
+        text: String,
+        capabilities: TextInputCapabilities
+    ): List<TextInputRoute> {
+        if (text.isEmpty()) return emptyList()
+
+        if (capabilities.hasAdbKeyboard) {
+            return listOf(TextInputRoute.ADB_KEYBOARD)
+        }
+
+        if (text.isAsciiOnly()) {
+            return listOf(TextInputRoute.ASCII_SHELL)
+        }
+
+        if (capabilities.hasAccessibilityService) {
+            return listOf(TextInputRoute.ACCESSIBILITY, TextInputRoute.CLIPBOARD)
+        }
+
+        return listOf(TextInputRoute.CLIPBOARD)
+    }
 
     /**
      * Returns true if currently connected to the local ADB daemon.
@@ -320,17 +356,18 @@ class AdbExecutor(private val context: Context) {
                 throw RuntimeException("Screenshot returned empty data after $SCREENSHOT_MAX_ATTEMPTS attempts")
             }
 
-            val fullBitmap = BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
-                ?: throw RuntimeException("Failed to decode screenshot PNG (${pngBytes.size} bytes)")
-
-            if (scale < 1.0f && scale > 0f) {
-                val scaledWidth = (fullBitmap.width * scale).toInt().coerceAtLeast(1)
-                val scaledHeight = (fullBitmap.height * scale).toInt().coerceAtLeast(1)
-                val scaled = Bitmap.createScaledBitmap(fullBitmap, scaledWidth, scaledHeight, true)
-                fullBitmap.recycle()
-                scaled
-            } else {
-                fullBitmap
+            try {
+                val effectiveScale = scale.coerceIn(0.01f, 1.0f)
+                if (effectiveScale < 1.0f) {
+                    ImageMemoryUtils.decodeBitmapAtScale(pngBytes, effectiveScale)
+                } else {
+                    BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
+                } ?: throw RuntimeException("Failed to decode screenshot PNG (${pngBytes.size} bytes)")
+            } catch (oom: OutOfMemoryError) {
+                throw RuntimeException(
+                    "Screenshot decode ran out of memory (${pngBytes.size} bytes, scale=$scale)",
+                    oom
+                )
             }
         }
     }

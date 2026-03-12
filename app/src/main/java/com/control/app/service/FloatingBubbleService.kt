@@ -985,6 +985,10 @@ private class AutomationEdgeGlowView(
     context: Context,
     private var glowColor: Int
 ) : View(context) {
+    companion object {
+        private const val EDGE_GLOW_STRONG_ALPHA = 112
+        private const val EDGE_GLOW_SOFT_ALPHA = 38
+    }
 
     private val edgePaint = Paint(Paint.ANTI_ALIAS_FLAG)
     private val cornerPaint = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -1028,8 +1032,8 @@ private class AutomationEdgeGlowView(
 
         val w = width.toFloat()
         val h = height.toFloat()
-        val strong = colorWithScaledAlpha(68, glowStrength)
-        val soft = colorWithScaledAlpha(18, glowStrength)
+        val strong = colorWithScaledAlpha(EDGE_GLOW_STRONG_ALPHA, glowStrength)
+        val soft = colorWithScaledAlpha(EDGE_GLOW_SOFT_ALPHA, glowStrength)
 
         edgePaint.shader = LinearGradient(
             0f, 0f, 0f, edgeSizePx,

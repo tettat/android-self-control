@@ -2,10 +2,8 @@ package com.control.app.ui.screens
 
 import android.app.Application
 import android.content.Intent
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Build
-import android.util.Base64
 import android.util.Log
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
@@ -53,6 +51,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -65,6 +64,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -77,8 +77,8 @@ import com.control.app.ControlApp
 import com.control.app.agent.DebugLogEntry
 import com.control.app.agent.DebugLogImage
 import com.control.app.agent.DebugLogType
-import com.control.app.ui.theme.MonospaceBodySmall
 import com.control.app.ui.theme.StatusColors
+import com.control.app.util.ImageMemoryUtils
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -477,7 +477,8 @@ private fun DebugLogCard(entry: DebugLogEntry) {
                         ) {
                             Text(
                                 text = formattedContent,
-                                style = MonospaceBodySmall.copy(
+                                style = MaterialTheme.typography.bodySmall.copy(
+                                    fontFamily = FontFamily.Monospace,
                                     color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
                                 )
                             )
@@ -510,13 +511,20 @@ private fun LogImageGallery(images: List<DebugLogImage>, compact: Boolean) {
 @Composable
 private fun ScreenshotThumbnail(base64: String, compact: Boolean, label: String) {
     var fullSize by remember { mutableStateOf(false) }
+    val maxLongEdge = when {
+        fullSize -> 1600
+        compact -> 720
+        else -> 1080
+    }
 
-    val bitmap = remember(base64) {
-        try {
-            val bytes = Base64.decode(base64, Base64.DEFAULT)
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
-        } catch (_: Exception) {
-            null
+    val bitmap = remember(base64, maxLongEdge) {
+        ImageMemoryUtils.decodeBase64ToBitmap(base64, maxLongEdge = maxLongEdge)
+    }
+    DisposableEffect(bitmap) {
+        onDispose {
+            if (bitmap != null && !bitmap.isRecycled) {
+                bitmap.recycle()
+            }
         }
     }
 
@@ -532,7 +540,7 @@ private fun ScreenshotThumbnail(base64: String, compact: Boolean, label: String)
                 modifier = Modifier.padding(bottom = 4.dp)
             )
             Image(
-                bitmap = bitmap,
+                bitmap = bitmap.asImageBitmap(),
                 contentDescription = label,
                 contentScale = ContentScale.FillWidth,
                 modifier = Modifier

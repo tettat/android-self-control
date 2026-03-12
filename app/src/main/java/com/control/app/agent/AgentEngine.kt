@@ -24,6 +24,7 @@ import com.control.app.prompt.DefaultPrompts
 import com.control.app.prompt.PromptManager
 import com.control.app.service.FloatingBubbleService
 import com.control.app.service.UiTreeAccessibilityService
+import com.control.app.util.ImageMemoryUtils
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -48,7 +49,6 @@ import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -100,6 +100,11 @@ class AgentEngine(
         private const val UI_DUMP_FAILURES_BEFORE_COOLDOWN = 2
         private const val UI_DUMP_COOLDOWN_CAPTURES = 5
         private const val MAX_UI_TREE_LINES = 150
+        private const val MAX_DEBUG_LOG_ENTRIES = 120
+        private const val MAX_DEBUG_LOG_IMAGE_ENTRIES = 24
+        private const val MAX_DEBUG_LOG_IMAGES_PER_ENTRY = 2
+        private const val DEBUG_LOG_IMAGE_MAX_LONG_EDGE = 1280
+        private const val DEBUG_LOG_IMAGE_JPEG_QUALITY = 72
         private val UI_BOUNDS_REGEX = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
         private val UI_NODE_REGEX = Regex("""<node\s+([^>]+?)/?>\s*""")
         private val UI_ATTR_REGEX = Regex("""(\w[\w-]*)="([^"]*?)"""")
@@ -273,12 +278,64 @@ class AgentEngine(
     }
 
     fun addLog(entry: DebugLogEntry) {
-        _debugLog.value = _debugLog.value + entry
-        sessionManager.addEntryToCurrentSession(entry)
+        val normalizedEntry = normalizeDebugLogEntry(entry)
+        _debugLog.value = trimDebugLogEntries(_debugLog.value + normalizedEntry)
+        sessionManager.addEntryToCurrentSession(normalizedEntry)
     }
 
     fun clearLogs() {
         _debugLog.value = emptyList()
+    }
+
+    private fun normalizeDebugLogEntry(entry: DebugLogEntry): DebugLogEntry {
+        val sourceImages = if (entry.images.isNotEmpty()) {
+            entry.images
+        } else {
+            entry.imageBase64?.let { listOf(DebugLogImage(base64 = it, mimeType = entry.imageMimeType)) }
+                ?: emptyList()
+        }
+        if (sourceImages.isEmpty()) return entry.withoutImages()
+
+        val normalizedImages = sourceImages
+            .take(MAX_DEBUG_LOG_IMAGES_PER_ENTRY)
+            .map(::normalizeDebugLogImage)
+
+        return entry.withImages(normalizedImages)
+    }
+
+    private fun normalizeDebugLogImage(image: DebugLogImage): DebugLogImage {
+        val transcoded = runCatching {
+            ImageMemoryUtils.transcodeBase64Image(
+                base64 = image.base64,
+                maxLongEdge = DEBUG_LOG_IMAGE_MAX_LONG_EDGE,
+                quality = DEBUG_LOG_IMAGE_JPEG_QUALITY
+            )
+        }.getOrNull() ?: return image
+
+        return if (transcoded.base64.length < image.base64.length) {
+            DebugLogImage(
+                base64 = transcoded.base64,
+                mimeType = transcoded.mimeType
+            )
+        } else {
+            image
+        }
+    }
+
+    private fun trimDebugLogEntries(entries: List<DebugLogEntry>): List<DebugLogEntry> {
+        val trimmed = entries.takeLast(MAX_DEBUG_LOG_ENTRIES).toMutableList()
+        var imageEntriesKept = 0
+        for (index in trimmed.lastIndex downTo 0) {
+            val entry = trimmed[index]
+            if (entry.images.isEmpty()) continue
+
+            if (imageEntriesKept < MAX_DEBUG_LOG_IMAGE_ENTRIES) {
+                imageEntriesKept++
+            } else {
+                trimmed[index] = entry.withoutImages()
+            }
+        }
+        return trimmed
     }
 
     private fun showTaskCompletionToast(message: String) {
@@ -2625,6 +2682,11 @@ class AgentEngine(
         }
     }
 
+    private fun decodeMutableBitmapOrThrow(imageBase64: String): Bitmap {
+        return ImageMemoryUtils.decodeBase64ToMutableBitmap(imageBase64)
+            ?: throw IllegalArgumentException("Failed to decode image for annotation")
+    }
+
     /**
      * Draw a tap marker on the screenshot at the given position (in screenshot pixel coordinates).
      * Returns the annotated image as a base64 string.
@@ -2635,55 +2697,46 @@ class AgentEngine(
         tapY: Int,
         label: String
     ): String {
-        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
-        val original = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(annotated)
-        canvas.drawBitmap(original, 0f, 0f, null)
-        original.recycle()
+        val annotated = decodeMutableBitmapOrThrow(imageBase64)
+        return try {
+            val canvas = Canvas(annotated)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+            paint.color = Color.RED
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 3f
+            canvas.drawCircle(tapX.toFloat(), tapY.toFloat(), 25f, paint)
 
-        // Red circle outline
-        paint.color = Color.RED
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = 3f
-        canvas.drawCircle(tapX.toFloat(), tapY.toFloat(), 25f, paint)
+            canvas.drawLine((tapX - 40).toFloat(), tapY.toFloat(), (tapX + 40).toFloat(), tapY.toFloat(), paint)
+            canvas.drawLine(tapX.toFloat(), (tapY - 40).toFloat(), tapX.toFloat(), (tapY + 40).toFloat(), paint)
 
-        // Crosshair lines
-        canvas.drawLine((tapX - 40).toFloat(), tapY.toFloat(), (tapX + 40).toFloat(), tapY.toFloat(), paint)
-        canvas.drawLine(tapX.toFloat(), (tapY - 40).toFloat(), tapX.toFloat(), (tapY + 40).toFloat(), paint)
+            paint.style = Paint.Style.FILL
+            canvas.drawCircle(tapX.toFloat(), tapY.toFloat(), 5f, paint)
 
-        // Center dot (filled)
-        paint.style = Paint.Style.FILL
-        canvas.drawCircle(tapX.toFloat(), tapY.toFloat(), 5f, paint)
+            paint.textSize = 28f
+            paint.color = Color.WHITE
+            val textBounds = Rect()
+            paint.getTextBounds(label, 0, label.length, textBounds)
+            val textX = (tapX + 30).toFloat()
+            val textY = (tapY - 30).toFloat()
 
-        // Text label with semi-transparent black background
-        paint.textSize = 28f
-        paint.color = Color.WHITE
-        val textBounds = Rect()
-        paint.getTextBounds(label, 0, label.length, textBounds)
-        val textX = (tapX + 30).toFloat()
-        val textY = (tapY - 30).toFloat()
+            val bgPaint = Paint().apply {
+                color = Color.argb(160, 0, 0, 0)
+                style = Paint.Style.FILL
+            }
+            canvas.drawRect(
+                textX - 4f,
+                textY + textBounds.top - 4f,
+                textX + textBounds.width() + 4f,
+                textY + textBounds.bottom + 4f,
+                bgPaint
+            )
 
-        // Background rect
-        val bgPaint = Paint()
-        bgPaint.color = Color.argb(160, 0, 0, 0)
-        bgPaint.style = Paint.Style.FILL
-        canvas.drawRect(
-            textX - 4f,
-            textY + textBounds.top - 4f,
-            textX + textBounds.width() + 4f,
-            textY + textBounds.bottom + 4f,
-            bgPaint
-        )
-
-        // Label text
-        canvas.drawText(label, textX, textY, paint)
-
-        val result = bitmapToBase64(annotated)
-        annotated.recycle()
-        return result
+            canvas.drawText(label, textX, textY, paint)
+            bitmapToBase64(annotated)
+        } finally {
+            annotated.recycle()
+        }
     }
 
     private fun buildSwipePath(
@@ -2731,85 +2784,83 @@ class AgentEngine(
 
         val (startX, startY) = pathPoints.first()
         val (endX, endY) = pathPoints.last()
-        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
-        val original = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(annotated)
-        canvas.drawBitmap(original, 0f, 0f, null)
-        original.recycle()
+        val annotated = decodeMutableBitmapOrThrow(imageBase64)
+        return try {
+            val canvas = Canvas(annotated)
 
-        val pathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.RED
-            style = Paint.Style.STROKE
-            strokeWidth = 8f
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-        }
-        pathPoints.zipWithNext().forEach { (start, end) ->
-            canvas.drawLine(
-                start.first.toFloat(),
-                start.second.toFloat(),
-                end.first.toFloat(),
-                end.second.toFloat(),
-                pathPaint
+            val pathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.RED
+                style = Paint.Style.STROKE
+                strokeWidth = 8f
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            pathPoints.zipWithNext().forEach { (start, end) ->
+                canvas.drawLine(
+                    start.first.toFloat(),
+                    start.second.toFloat(),
+                    end.first.toFloat(),
+                    end.second.toFloat(),
+                    pathPaint
+                )
+            }
+
+            val penultimate = pathPoints[pathPoints.lastIndex - 1]
+            val angle = atan2(
+                (endY - penultimate.second).toFloat(),
+                (endX - penultimate.first).toFloat()
             )
-        }
+            val arrowLength = 30f
+            val arrowSpread = 0.55f
+            val arrowX1 = endX - arrowLength * cos(angle - arrowSpread)
+            val arrowY1 = endY - arrowLength * sin(angle - arrowSpread)
+            val arrowX2 = endX - arrowLength * cos(angle + arrowSpread)
+            val arrowY2 = endY - arrowLength * sin(angle + arrowSpread)
+            canvas.drawLine(endX.toFloat(), endY.toFloat(), arrowX1.toFloat(), arrowY1.toFloat(), pathPaint)
+            canvas.drawLine(endX.toFloat(), endY.toFloat(), arrowX2.toFloat(), arrowY2.toFloat(), pathPaint)
 
-        val penultimate = pathPoints[pathPoints.lastIndex - 1]
-        val angle = atan2(
-            (endY - penultimate.second).toFloat(),
-            (endX - penultimate.first).toFloat()
-        )
-        val arrowLength = 30f
-        val arrowSpread = 0.55f
-        val arrowX1 = endX - arrowLength * cos(angle - arrowSpread)
-        val arrowY1 = endY - arrowLength * sin(angle - arrowSpread)
-        val arrowX2 = endX - arrowLength * cos(angle + arrowSpread)
-        val arrowY2 = endY - arrowLength * sin(angle + arrowSpread)
-        canvas.drawLine(endX.toFloat(), endY.toFloat(), arrowX1.toFloat(), arrowY1.toFloat(), pathPaint)
-        canvas.drawLine(endX.toFloat(), endY.toFloat(), arrowX2.toFloat(), arrowY2.toFloat(), pathPaint)
+            val startPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(220, 0, 200, 83)
+                style = Paint.Style.FILL
+            }
+            val endPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(220, 244, 67, 54)
+                style = Paint.Style.FILL
+            }
+            val markerOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+            }
+            canvas.drawCircle(startX.toFloat(), startY.toFloat(), 14f, startPaint)
+            canvas.drawCircle(endX.toFloat(), endY.toFloat(), 14f, endPaint)
+            canvas.drawCircle(startX.toFloat(), startY.toFloat(), 18f, markerOutlinePaint)
+            canvas.drawCircle(endX.toFloat(), endY.toFloat(), 18f, markerOutlinePaint)
 
-        val startPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(220, 0, 200, 83)
-            style = Paint.Style.FILL
-        }
-        val endPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(220, 244, 67, 54)
-            style = Paint.Style.FILL
-        }
-        val markerOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.STROKE
-            strokeWidth = 3f
-        }
-        canvas.drawCircle(startX.toFloat(), startY.toFloat(), 14f, startPaint)
-        canvas.drawCircle(endX.toFloat(), endY.toFloat(), 14f, endPaint)
-        canvas.drawCircle(startX.toFloat(), startY.toFloat(), 18f, markerOutlinePaint)
-        canvas.drawCircle(endX.toFloat(), endY.toFloat(), 18f, markerOutlinePaint)
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = 28f
+                color = Color.WHITE
+                style = Paint.Style.FILL
+            }
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(160, 0, 0, 0)
+                style = Paint.Style.FILL
+            }
+            drawAnnotationLabel(canvas, textPaint, bgPaint, "START", startX + 24f, startY - 20f)
+            drawAnnotationLabel(canvas, textPaint, bgPaint, "END", endX + 24f, endY - 20f)
+            drawAnnotationLabel(
+                canvas,
+                textPaint,
+                bgPaint,
+                label,
+                ((startX + endX) / 2f) + 24f,
+                ((startY + endY) / 2f) - 24f
+            )
 
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            textSize = 28f
-            color = Color.WHITE
-            style = Paint.Style.FILL
+            bitmapToBase64(annotated)
+        } finally {
+            annotated.recycle()
         }
-        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(160, 0, 0, 0)
-            style = Paint.Style.FILL
-        }
-        drawAnnotationLabel(canvas, textPaint, bgPaint, "START", startX + 24f, startY - 20f)
-        drawAnnotationLabel(canvas, textPaint, bgPaint, "END", endX + 24f, endY - 20f)
-        drawAnnotationLabel(
-            canvas,
-            textPaint,
-            bgPaint,
-            label,
-            ((startX + endX) / 2f) + 24f,
-            ((startY + endY) / 2f) - 24f
-        )
-
-        val result = bitmapToBase64(annotated)
-        annotated.recycle()
-        return result
     }
 
     private fun drawAnnotationLabel(
@@ -2839,80 +2890,78 @@ class AgentEngine(
     ): String {
         if (points.isEmpty()) return imageBase64
 
-        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
-        val original = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(annotated)
-        canvas.drawBitmap(original, 0f, 0f, null)
-        original.recycle()
+        val annotated = decodeMutableBitmapOrThrow(imageBase64)
+        return try {
+            val canvas = Canvas(annotated)
 
-        val pathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(230, 255, 152, 0)
-            style = Paint.Style.STROKE
-            strokeWidth = 7f
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-        }
-        points.zipWithNext { start, end ->
-            canvas.drawLine(
-                start.first.toFloat(),
-                start.second.toFloat(),
-                end.first.toFloat(),
-                end.second.toFloat(),
-                pathPaint
-            )
-        }
-
-        val markerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            style = Paint.Style.FILL
-            textAlign = Paint.Align.CENTER
-            textSize = 24f
-        }
-        val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.STROKE
-            strokeWidth = 3f
-        }
-        val numberPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE
-            style = Paint.Style.FILL
-            textAlign = Paint.Align.CENTER
-            textSize = 24f
-        }
-
-        points.forEachIndexed { index, (x, y) ->
-            markerPaint.color = when (index) {
-                0 -> Color.argb(220, 76, 175, 80)
-                points.lastIndex -> Color.argb(220, 244, 67, 54)
-                else -> Color.argb(220, 255, 152, 0)
+            val pathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(230, 255, 152, 0)
+                style = Paint.Style.STROKE
+                strokeWidth = 7f
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
             }
-            canvas.drawCircle(x.toFloat(), y.toFloat(), 18f, markerPaint)
-            canvas.drawCircle(x.toFloat(), y.toFloat(), 21f, outlinePaint)
-            val baseline = y - (numberPaint.descent() + numberPaint.ascent()) / 2f
-            canvas.drawText((index + 1).toString(), x.toFloat(), baseline, numberPaint)
-        }
+            points.zipWithNext { start, end ->
+                canvas.drawLine(
+                    start.first.toFloat(),
+                    start.second.toFloat(),
+                    end.first.toFloat(),
+                    end.second.toFloat(),
+                    pathPaint
+                )
+            }
 
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            textSize = 28f
-            color = Color.WHITE
-            style = Paint.Style.FILL
-        }
-        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(160, 0, 0, 0)
-            style = Paint.Style.FILL
-        }
-        drawAnnotationLabel(
-            canvas,
-            textPaint,
-            bgPaint,
-            label,
-            points.first().first + 28f,
-            points.first().second - 28f
-        )
+            val markerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.FILL
+                textAlign = Paint.Align.CENTER
+                textSize = 24f
+            }
+            val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+            }
+            val numberPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.FILL
+                textAlign = Paint.Align.CENTER
+                textSize = 24f
+            }
 
-        val result = bitmapToBase64(annotated)
-        annotated.recycle()
-        return result
+            points.forEachIndexed { index, (x, y) ->
+                markerPaint.color = when (index) {
+                    0 -> Color.argb(220, 76, 175, 80)
+                    points.lastIndex -> Color.argb(220, 244, 67, 54)
+                    else -> Color.argb(220, 255, 152, 0)
+                }
+                canvas.drawCircle(x.toFloat(), y.toFloat(), 18f, markerPaint)
+                canvas.drawCircle(x.toFloat(), y.toFloat(), 21f, outlinePaint)
+                val baseline = y - (numberPaint.descent() + numberPaint.ascent()) / 2f
+                canvas.drawText((index + 1).toString(), x.toFloat(), baseline, numberPaint)
+            }
+
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = 28f
+                color = Color.WHITE
+                style = Paint.Style.FILL
+            }
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(160, 0, 0, 0)
+                style = Paint.Style.FILL
+            }
+            drawAnnotationLabel(
+                canvas,
+                textPaint,
+                bgPaint,
+                label,
+                points.first().first + 28f,
+                points.first().second - 28f
+            )
+
+            bitmapToBase64(annotated)
+        } finally {
+            annotated.recycle()
+        }
     }
 
     private fun mapScreenPointToScreenshot(x: Int, y: Int): Pair<Int, Int> {
@@ -2952,58 +3001,49 @@ class AgentEngine(
      * Returns the annotated image as base64.
      */
     private fun drawZoneGrid(imageBase64: String): String {
-        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
-        val original = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(annotated)
-        canvas.drawBitmap(original, 0f, 0f, null)
-        original.recycle()
+        val annotated = decodeMutableBitmapOrThrow(imageBase64)
+        return try {
+            val canvas = Canvas(annotated)
+            val w = annotated.width.toFloat()
+            val h = annotated.height.toFloat()
+            val cellW = w / 3f
+            val cellH = h / 3f
 
-        val w = annotated.width.toFloat()
-        val h = annotated.height.toFloat()
-        val cellW = w / 3f
-        val cellH = h / 3f
-
-        // Draw grid lines
-        val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(128, 0, 255, 0) // semi-transparent green
-            style = Paint.Style.STROKE
-            strokeWidth = 3f
-        }
-        // Vertical lines
-        canvas.drawLine(cellW, 0f, cellW, h, linePaint)
-        canvas.drawLine(cellW * 2, 0f, cellW * 2, h, linePaint)
-        // Horizontal lines
-        canvas.drawLine(0f, cellH, w, cellH, linePaint)
-        canvas.drawLine(0f, cellH * 2, w, cellH * 2, linePaint)
-
-        // Draw zone numbers
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(180, 0, 255, 0)
-            textSize = 48f
-            textAlign = Paint.Align.CENTER
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-        }
-        val bgPaint = Paint().apply {
-            color = Color.argb(100, 0, 0, 0)
-            style = Paint.Style.FILL
-        }
-
-        for (row in 0..2) {
-            for (col in 0..2) {
-                val zone = row * 3 + col + 1
-                val cx = cellW * col + cellW / 2
-                val cy = cellH * row + cellH / 2
-                // Background circle behind number
-                canvas.drawCircle(cx, cy, 30f, bgPaint)
-                // Zone number
-                canvas.drawText(zone.toString(), cx, cy + 16f, textPaint)
+            val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(128, 0, 255, 0)
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
             }
-        }
+            canvas.drawLine(cellW, 0f, cellW, h, linePaint)
+            canvas.drawLine(cellW * 2, 0f, cellW * 2, h, linePaint)
+            canvas.drawLine(0f, cellH, w, cellH, linePaint)
+            canvas.drawLine(0f, cellH * 2, w, cellH * 2, linePaint)
 
-        val result = bitmapToBase64(annotated)
-        annotated.recycle()
-        return result
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(180, 0, 255, 0)
+                textSize = 48f
+                textAlign = Paint.Align.CENTER
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            }
+            val bgPaint = Paint().apply {
+                color = Color.argb(100, 0, 0, 0)
+                style = Paint.Style.FILL
+            }
+
+            for (row in 0..2) {
+                for (col in 0..2) {
+                    val zone = row * 3 + col + 1
+                    val cx = cellW * col + cellW / 2
+                    val cy = cellH * row + cellH / 2
+                    canvas.drawCircle(cx, cy, 30f, bgPaint)
+                    canvas.drawText(zone.toString(), cx, cy + 16f, textPaint)
+                }
+            }
+
+            bitmapToBase64(annotated)
+        } finally {
+            annotated.recycle()
+        }
     }
 
     /**
@@ -3078,10 +3118,7 @@ class AgentEngine(
         format: Bitmap.CompressFormat = Bitmap.CompressFormat.PNG,
         quality: Int = 100
     ): String {
-        val outputStream = ByteArrayOutputStream()
-        bitmap.compress(format, quality, outputStream)
-        val bytes = outputStream.toByteArray()
-        return Base64.encodeToString(bytes, Base64.NO_WRAP)
+        return ImageMemoryUtils.encodeBitmapToBase64(bitmap, format, quality)
     }
 
     private fun formatTimestamp(millis: Long): String {

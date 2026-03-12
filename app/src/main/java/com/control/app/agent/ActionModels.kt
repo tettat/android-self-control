@@ -49,6 +49,18 @@ data class DebugLogEntry(
     } ?: emptyList()
 )
 
+fun DebugLogEntry.withImages(images: List<DebugLogImage>): DebugLogEntry = copy(
+    imageBase64 = images.firstOrNull()?.base64,
+    imageMimeType = images.firstOrNull()?.mimeType,
+    images = images
+)
+
+fun DebugLogEntry.withoutImages(): DebugLogEntry = copy(
+    imageBase64 = null,
+    imageMimeType = null,
+    images = emptyList()
+)
+
 enum class DebugLogType {
     VOICE_INPUT,
     SCREENSHOT,
