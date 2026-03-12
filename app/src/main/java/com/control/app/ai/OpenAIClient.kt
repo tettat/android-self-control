@@ -2,6 +2,7 @@ package com.control.app.ai
 
 import android.util.Log
 import com.control.app.agent.AIChatResult
+import com.control.app.agent.DebugLogImage
 import com.control.app.agent.ToolCall
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -9,6 +10,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -32,12 +34,21 @@ class OpenAIClient {
 
     data class HttpLogEntry(
         val title: String,
-        val content: String
+        val content: String,
+        val imageBase64: String? = null,
+        val imageMimeType: String? = null,
+        val images: List<DebugLogImage> = imageBase64?.let {
+            listOf(DebugLogImage(base64 = it, mimeType = imageMimeType))
+        } ?: emptyList()
     )
 
     companion object {
         private const val TAG = "OpenAIClient"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private val DATA_IMAGE_URL_REGEX = Regex(
+            pattern = "^data:(image/[^;]+);base64,(.+)$",
+            options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
     }
 
     private val json = Json {
@@ -82,12 +93,7 @@ class OpenAIClient {
                 .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
-            logHttp?.invoke(
-                HttpLogEntry(
-                    title = "AI 请求详情",
-                    content = buildRequestLog(request, requestJson)
-                )
-            )
+            logHttp?.invoke(buildRequestLog(request, requestJson))
 
             val responseBody = executeRequest(request, logHttp)
             parseToolResponse(responseBody)
@@ -266,13 +272,36 @@ class OpenAIClient {
         }
     }
 
-    private fun buildRequestLog(request: Request, requestJson: String): String = buildString {
-        appendLine("Method: ${request.method}")
-        appendLine("URL: ${request.url}")
-        appendLine("Headers:")
-        appendLine(formatHeaders(request.headers))
-        appendLine("Body:")
-        append(requestJson)
+    private data class EmbeddedImageSummary(
+        val mimeType: String,
+        val base64Chars: Int,
+        val image: DebugLogImage
+    ) {
+        val estimatedBytes: Long
+            get() = if (base64Chars <= 0) 0L else (base64Chars.toLong() * 3L) / 4L
+    }
+
+    private data class RequestLogPresentation(
+        val body: String,
+        val images: List<DebugLogImage> = emptyList()
+    )
+
+    private fun buildRequestLog(request: Request, requestJson: String): HttpLogEntry {
+        val presentation = formatRequestBodyForLog(requestJson)
+        return HttpLogEntry(
+            title = "AI 请求详情",
+            content = buildString {
+                appendLine("Method: ${request.method}")
+                appendLine("URL: ${request.url}")
+                appendLine("Headers:")
+                appendLine(formatHeaders(request.headers))
+                appendLine("Body:")
+                append(presentation.body)
+            },
+            imageBase64 = presentation.images.firstOrNull()?.base64,
+            imageMimeType = presentation.images.firstOrNull()?.mimeType,
+            images = presentation.images
+        )
     }
 
     private fun buildResponseLog(response: Response, body: String): String = buildString {
@@ -307,6 +336,85 @@ class OpenAIClient {
         val token = parts[1]
         val visible = token.takeLast(minOf(6, token.length))
         return "$scheme ***$visible"
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    private fun formatRequestBodyForLog(requestJson: String): RequestLogPresentation {
+        return try {
+            val imageSummaries = mutableListOf<EmbeddedImageSummary>()
+            val parsed = json.parseToJsonElement(requestJson)
+            val sanitized = sanitizeJsonElementForLog(parsed, imageSummaries)
+            val prettyJson = Json {
+                prettyPrint = true
+            }.encodeToString(sanitized)
+
+            val body = if (imageSummaries.isEmpty()) {
+                prettyJson
+            } else {
+                buildString {
+                    appendLine("Embedded images: ${imageSummaries.size}")
+                    imageSummaries.forEachIndexed { index, summary ->
+                        appendLine(
+                            "  - #${index + 1}: ${summary.mimeType}, " +
+                                formatByteCount(summary.estimatedBytes) +
+                                ", base64=${summary.base64Chars} chars"
+                        )
+                    }
+                    append(prettyJson)
+                }.trimEnd()
+            }
+            RequestLogPresentation(
+                body = body,
+                images = imageSummaries.map { it.image }
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sanitize request body for logging", e)
+            RequestLogPresentation(body = requestJson)
+        }
+    }
+
+    private fun sanitizeJsonElementForLog(
+        element: JsonElement,
+        imageSummaries: MutableList<EmbeddedImageSummary>
+    ): JsonElement {
+        return when (element) {
+            is JsonObject -> JsonObject(
+                element.mapValues { (_, value) -> sanitizeJsonElementForLog(value, imageSummaries) }
+            )
+
+            is JsonArray -> JsonArray(
+                element.map { item -> sanitizeJsonElementForLog(item, imageSummaries) }
+            )
+
+            is JsonPrimitive -> {
+                val match = DATA_IMAGE_URL_REGEX.matchEntire(element.content)
+                if (match != null) {
+                    val mimeType = match.groupValues[1]
+                    val base64Data = match.groupValues[2]
+                    val summary = EmbeddedImageSummary(
+                        mimeType = mimeType,
+                        base64Chars = base64Data.length,
+                        image = DebugLogImage(base64 = base64Data, mimeType = mimeType)
+                    )
+                    imageSummaries += summary
+                    JsonPrimitive(
+                        "<embedded image omitted: ${summary.mimeType}, " +
+                            "${formatByteCount(summary.estimatedBytes)}, " +
+                            "base64=${summary.base64Chars} chars>"
+                    )
+                } else {
+                    element
+                }
+            }
+        }
+    }
+
+    private fun formatByteCount(bytes: Long): String {
+        if (bytes < 1024) return "${bytes}B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format("%.1fKB", kb)
+        val mb = kb / 1024.0
+        return String.format("%.2fMB", mb)
     }
 
     /**

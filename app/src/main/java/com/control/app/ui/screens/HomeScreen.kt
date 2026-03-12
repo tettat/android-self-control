@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -44,6 +45,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Mic
@@ -105,6 +108,7 @@ import com.control.app.ControlApp
 import com.control.app.agent.AgentState
 import com.control.app.agent.DebugLogEntry
 import com.control.app.agent.DebugLogType
+import com.control.app.agent.StepTiming
 import com.control.app.log.ExecutionLogFormatter
 import com.control.app.service.FloatingBubbleService
 import com.control.app.ui.navigation.Routes
@@ -836,7 +840,7 @@ private fun StatusIndicator(
     val totalSeconds = if (agentState.taskStartedAtMs > 0L) {
         ((nowMs - agentState.taskStartedAtMs).coerceAtLeast(0L)) / 1000
     } else 0L
-    val phaseSeconds = if (agentState.phaseStartedAtMs > 0L) {
+    val stepSeconds = if (agentState.phaseStartedAtMs > 0L) {
         ((nowMs - agentState.phaseStartedAtMs).coerceAtLeast(0L)) / 1000
     } else 0L
     val idleSeconds = if (agentState.lastProgressAtMs > 0L) {
@@ -869,7 +873,7 @@ private fun StatusIndicator(
             Text(
                 text = buildString {
                     append("总耗时 ${formatDuration(totalSeconds)}")
-                    append(" | 当前阶段 ${formatDuration(phaseSeconds)}")
+                    append(" | 当前步骤耗时 ${formatDuration(stepSeconds)}")
                     if (idleSeconds >= 5) {
                         append(" | 无新进展 ${formatDuration(idleSeconds)}")
                     }
@@ -897,6 +901,60 @@ private fun StatusIndicator(
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis
                 )
+            }
+        } else if (agentState.stepTimings.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "总耗时 ${formatDuration(totalSeconds)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            StepTimingSummary(stepTimings = agentState.stepTimings)
+        }
+    }
+}
+
+@Composable
+private fun StepTimingSummary(stepTimings: List<StepTiming>) {
+    Column(
+        horizontalAlignment = Alignment.Start,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 220.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        Text(
+            text = "步骤耗时",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        stepTimings.forEachIndexed { index, step ->
+            val presentation = ExecutionLogFormatter.describeStepTiming(step)
+            Text(
+                text = "${index + 1}. [${presentation.category}] ${presentation.title}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "耗时 ${ExecutionLogFormatter.formatDurationMs(step.durationMs)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            if (presentation.subtitle.isNotBlank()) {
+                Text(
+                    text = presentation.subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (index != stepTimings.lastIndex) {
+                Spacer(modifier = Modifier.height(6.dp))
             }
         }
     }

@@ -15,6 +15,7 @@ import com.control.app.adb.AdbExecutor
 import com.control.app.ai.OpenAIClient
 import com.control.app.data.AppSettings
 import com.control.app.data.SettingsStore
+import com.control.app.log.ExecutionLogFormatter
 import com.control.app.prompt.DefaultPrompts
 import com.control.app.prompt.PromptManager
 import kotlinx.coroutines.CancellationException
@@ -99,15 +100,64 @@ class AgentEngine(
     ) {
         val prev = _agentState.value
         val now = System.currentTimeMillis()
+        val statusChanged = statusMessage != prev.statusMessage
         _agentState.value = prev.copy(
             currentRound = currentRound,
             statusMessage = statusMessage,
             activeTool = activeTool,
             lastThinking = lastThinking,
             lastAction = lastAction,
-            phaseStartedAtMs = if (statusMessage != prev.statusMessage) now else prev.phaseStartedAtMs,
+            phaseStartedAtMs = if (statusChanged) now else prev.phaseStartedAtMs,
+            stepTimings = if (statusChanged) finalizeCurrentStep(prev, now) else prev.stepTimings,
             lastProgressAtMs = now
         )
+    }
+
+    private fun finalizeCurrentStep(state: AgentState, endTimeMs: Long): List<StepTiming> {
+        if (state.phaseStartedAtMs <= 0L || state.statusMessage.isBlank()) {
+            return state.stepTimings
+        }
+
+        val durationMs = (endTimeMs - state.phaseStartedAtMs).coerceAtLeast(0L)
+        val previous = state.stepTimings.lastOrNull()
+        if (previous != null &&
+            previous.label == state.statusMessage &&
+            previous.startedAtMs == state.phaseStartedAtMs
+        ) {
+            return state.stepTimings
+        }
+
+        return state.stepTimings + StepTiming(
+            label = state.statusMessage,
+            tool = state.activeTool,
+            startedAtMs = state.phaseStartedAtMs,
+            finishedAtMs = endTimeMs,
+            durationMs = durationMs
+        )
+    }
+
+    private fun buildStepTimingSummary(stepTimings: List<StepTiming>): String {
+        if (stepTimings.isEmpty()) return "无步骤耗时记录"
+        return buildString {
+            stepTimings.forEachIndexed { index, step ->
+                append(ExecutionLogFormatter.formatStepTimingLine(index, step))
+                if (index != stepTimings.lastIndex) {
+                    append('\n')
+                }
+            }
+        }
+    }
+
+    private fun formatDurationMs(durationMs: Long): String {
+        val safe = durationMs.coerceAtLeast(0L)
+        return if (safe < 1_000L) {
+            "${safe}ms"
+        } else {
+            val totalSeconds = safe / 1000
+            val minutes = totalSeconds / 60
+            val seconds = totalSeconds % 60
+            if (minutes > 0) "${minutes}m${seconds}s" else "${seconds}s"
+        }
     }
 
     fun addLog(entry: DebugLogEntry) {
@@ -163,6 +213,7 @@ class AgentEngine(
         // Create a new session for this task
         val session = sessionManager.createSession(voiceCommand)
         val startTime = System.currentTimeMillis()
+        var finalStepTimings: List<StepTiming> = emptyList()
 
         _agentState.value = AgentState(
             isRunning = true,
@@ -268,7 +319,10 @@ class AgentEngine(
                                     DebugLogType.API_REQUEST
                                 },
                                 title = "${httpLog.title} (第${step}步)",
-                                content = httpLog.content
+                                content = httpLog.content,
+                                imageBase64 = httpLog.imageBase64,
+                                imageMimeType = httpLog.imageMimeType,
+                                images = httpLog.images
                             )
                         )
                     }
@@ -499,6 +553,8 @@ class AgentEngine(
             Log.e(TAG, "Task failed", e)
         } finally {
             _overlayVisible.value = true
+            val finishTime = System.currentTimeMillis()
+            finalStepTimings = finalizeCurrentStep(_agentState.value, finishTime)
             _agentState.value = AgentState(
                 isRunning = false,
                 currentRound = step,
@@ -506,21 +562,31 @@ class AgentEngine(
                 statusMessage = resultMessage,
                 lastAction = resultMessage,
                 taskStartedAtMs = startTime,
-                phaseStartedAtMs = System.currentTimeMillis(),
-                lastProgressAtMs = System.currentTimeMillis()
+                phaseStartedAtMs = finishTime,
+                lastProgressAtMs = finishTime,
+                stepTimings = finalStepTimings
+            )
+            addLog(
+                DebugLogEntry(
+                    type = DebugLogType.INFO,
+                    title = "任务结束",
+                    content = buildString {
+                        appendLine("结果: $resultMessage")
+                        appendLine("总步数: $step")
+                        append("总耗时: ${formatDurationMs(finishTime - startTime)}")
+                        if (finalStepTimings.isNotEmpty()) {
+                            appendLine()
+                            appendLine()
+                            appendLine("步骤耗时:")
+                            append(buildStepTimingSummary(finalStepTimings))
+                        }
+                    }
+                )
             )
             // Mark session as ended
             sessionManager.endCurrentSession(resultMessage)
             showTaskCompletionToast(resultMessage)
         }
-
-        addLog(
-            DebugLogEntry(
-                type = DebugLogType.INFO,
-                title = "任务结束",
-                content = "结果: $resultMessage\n总步数: $step"
-            )
-        )
 
         resultMessage
     }
@@ -1074,13 +1140,16 @@ class AgentEngine(
         currentJob?.cancel()
         currentJob = null
         _overlayVisible.value = true
-        val now = System.currentTimeMillis()
-        _agentState.value = AgentState(
-            statusMessage = "已取消",
-            lastAction = "用户取消任务",
-            phaseStartedAtMs = now,
-            lastProgressAtMs = now
-        )
+        val current = _agentState.value
+        if (!current.isRunning) {
+            val now = System.currentTimeMillis()
+            _agentState.value = current.copy(
+                statusMessage = "已取消",
+                lastAction = "用户取消任务",
+                phaseStartedAtMs = now,
+                lastProgressAtMs = now
+            )
+        }
     }
 
     fun setCurrentJob(job: Job) {

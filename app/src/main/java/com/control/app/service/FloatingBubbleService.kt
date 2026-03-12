@@ -701,7 +701,7 @@ class FloatingBubbleService : Service() {
     private fun buildOverlayText(state: AgentState): String {
         val now = System.currentTimeMillis()
         val totalSeconds = ((now - state.taskStartedAtMs).coerceAtLeast(0L)) / 1000
-        val phaseSeconds = ((now - state.phaseStartedAtMs).coerceAtLeast(0L)) / 1000
+        val stepSeconds = ((now - state.phaseStartedAtMs).coerceAtLeast(0L)) / 1000
         val idleSeconds = ((now - state.lastProgressAtMs).coerceAtLeast(0L)) / 1000
 
         return buildString {
@@ -712,7 +712,7 @@ class FloatingBubbleService : Service() {
             if (state.lastAction.isNotBlank()) {
                 append("\n进展: ${state.lastAction.take(120)}")
             }
-            append("\n总耗时 ${formatDuration(totalSeconds)} | 当前阶段 ${formatDuration(phaseSeconds)}")
+            append("\n总耗时 ${formatDuration(totalSeconds)} | 当前步骤耗时 ${formatDuration(stepSeconds)}")
             if (idleSeconds >= 5) {
                 append(" | 无新进展 ${formatDuration(idleSeconds)}")
             }

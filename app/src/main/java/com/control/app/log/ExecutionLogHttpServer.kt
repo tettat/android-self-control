@@ -317,7 +317,7 @@ class ExecutionLogHttpServer(
                           </div>
                           <h3>${escapeHtml(entry.title)}</h3>
                           <pre>${escapeHtml(entry.content)}</pre>
-                          ${if (entry.imageBase64 != null) """<div class="meta">包含截图数据，JSON 接口可选返回图片</div>""" else ""}
+                          ${buildEntryImagesHtml(entry.images)}
                         </article>
                         """.trimIndent()
                     )
@@ -335,6 +335,21 @@ class ExecutionLogHttpServer(
                 val encodedId = URLEncoder.encode(selectedSession.id, StandardCharsets.UTF_8.name())
                 append("&sessionId=$encodedId")
             }
+        }
+        val stepTimingItems = agentState.stepTimings.mapIndexed { index, step ->
+            val presentation = ExecutionLogFormatter.describeStepTiming(step)
+            """
+                <li>
+                  <strong>${index + 1}. [${escapeHtml(presentation.category)}] ${escapeHtml(presentation.title)}</strong>
+                  <div class="meta">耗时: ${escapeHtml(ExecutionLogFormatter.formatDurationMs(step.durationMs))}</div>
+                  ${if (presentation.subtitle.isNotBlank()) """<div class="meta">${escapeHtml(presentation.subtitle)}</div>""" else ""}
+                </li>
+            """.trimIndent()
+        }.joinToString("")
+        val stepTimingSection = if (agentState.stepTimings.isEmpty()) {
+            """<div class="meta">任务完成或终止后，会在这里展示每一步耗时。</div>"""
+        } else {
+            """<ul class="meta">$stepTimingItems</ul>"""
         }
 
         return """
@@ -489,6 +504,16 @@ class ExecutionLogHttpServer(
                   font-family: inherit;
                   line-height: 1.55;
                 }
+                .entry-image {
+                  margin-top: 12px;
+                }
+                .entry-image img {
+                  display: block;
+                  width: min(100%, 420px);
+                  border-radius: 12px;
+                  border: 1px solid var(--line);
+                  background: rgba(255, 250, 242, 0.7);
+                }
                 .entry.error { border-color: #e7b7a6; }
                 .entry.info { border-color: #c9d6d2; }
                 .entry.action_executed { border-color: #bfdac5; }
@@ -547,6 +572,10 @@ class ExecutionLogHttpServer(
                         <a href="/api/sessions">/api/sessions</a>
                         <a href="/health">/health</a>
                       </div>
+                    </section>
+                    <section>
+                      <h2>步骤耗时</h2>
+                      $stepTimingSection
                     </section>
                   </div>
                 </section>
@@ -680,6 +709,19 @@ class ExecutionLogHttpServer(
                 key to value
             }
             .toMap()
+    }
+
+    private fun buildEntryImagesHtml(images: List<com.control.app.agent.DebugLogImage>): String {
+        if (images.isEmpty()) return ""
+        return images.mapIndexed { index, image ->
+            val mimeType = image.mimeType?.ifBlank { null } ?: "image/png"
+            """
+                <div class="entry-image">
+                  <div class="meta">图片 ${index + 1}/${images.size}</div>
+                  <img src="${escapeHtml("data:$mimeType;base64,${image.base64}")}" alt="日志图片预览 ${index + 1}" loading="lazy">
+                </div>
+            """.trimIndent()
+        }.joinToString("\n")
     }
 
     private fun decode(value: String): String =

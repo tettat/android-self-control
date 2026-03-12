@@ -31,13 +31,22 @@ sealed class AIChatResult {
 
 // --- Debug / state models (unchanged) ---
 
+data class DebugLogImage(
+    val base64: String,
+    val mimeType: String? = null
+)
+
 data class DebugLogEntry(
     val id: String = UUID.randomUUID().toString(),
     val timestamp: Long = System.currentTimeMillis(),
     val type: DebugLogType,
     val title: String,
     val content: String,
-    val imageBase64: String? = null
+    val imageBase64: String? = null,
+    val imageMimeType: String? = null,
+    val images: List<DebugLogImage> = imageBase64?.let {
+        listOf(DebugLogImage(base64 = it, mimeType = imageMimeType))
+    } ?: emptyList()
 )
 
 enum class DebugLogType {
@@ -50,6 +59,14 @@ enum class DebugLogType {
     INFO
 }
 
+data class StepTiming(
+    val label: String,
+    val tool: String = "",
+    val startedAtMs: Long,
+    val finishedAtMs: Long,
+    val durationMs: Long
+)
+
 data class AgentState(
     val isRunning: Boolean = false,
     val currentRound: Int = 0,
@@ -61,5 +78,6 @@ data class AgentState(
     val lastAction: String = "",
     val taskStartedAtMs: Long = 0L,
     val phaseStartedAtMs: Long = 0L,
-    val lastProgressAtMs: Long = 0L
+    val lastProgressAtMs: Long = 0L,
+    val stepTimings: List<StepTiming> = emptyList()
 )

@@ -75,6 +75,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import com.control.app.ControlApp
 import com.control.app.agent.DebugLogEntry
+import com.control.app.agent.DebugLogImage
 import com.control.app.agent.DebugLogType
 import com.control.app.ui.theme.MonospaceBodySmall
 import com.control.app.ui.theme.StatusColors
@@ -120,11 +121,12 @@ class DebugViewModel(application: Application) : AndroidViewModel(application) {
                         put("type", entry.type.name)
                         put("title", entry.title)
                         put("content", entry.content)
-                        put("hasImage", entry.imageBase64 != null)
-                        if (entry.imageBase64 != null) {
-                            // Store approximate decoded size instead of full base64
-                            val sizeKB = entry.imageBase64.length * 3 / 4 / 1024
+                        put("hasImage", entry.images.isNotEmpty())
+                        put("imageCount", entry.images.size)
+                        if (entry.images.isNotEmpty()) {
+                            val sizeKB = entry.images.sumOf { it.base64.length * 3 / 4 / 1024 }
                             put("imageSizeKB", sizeKB)
+                            put("imageMimeType", entry.images.firstOrNull()?.mimeType ?: entry.imageMimeType ?: "image/png")
                         }
                     }
                     jsonEntries.put(obj)
@@ -446,6 +448,11 @@ private fun DebugLogCard(entry: DebugLogEntry) {
                 )
             }
 
+            if (!expanded && entry.images.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(8.dp))
+                LogImageGallery(images = entry.images, compact = true)
+            }
+
             // Expanded content
             AnimatedVisibility(
                 visible = expanded,
@@ -477,10 +484,9 @@ private fun DebugLogCard(entry: DebugLogEntry) {
                         }
                     }
 
-                    // Screenshot thumbnail
-                    if (entry.imageBase64 != null) {
+                    if (entry.images.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(8.dp))
-                        ScreenshotThumbnail(base64 = entry.imageBase64)
+                        LogImageGallery(images = entry.images, compact = false)
                     }
                 }
             }
@@ -489,7 +495,20 @@ private fun DebugLogCard(entry: DebugLogEntry) {
 }
 
 @Composable
-private fun ScreenshotThumbnail(base64: String) {
+private fun LogImageGallery(images: List<DebugLogImage>, compact: Boolean) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        images.forEachIndexed { index, image ->
+            ScreenshotThumbnail(
+                base64 = image.base64,
+                compact = compact,
+                label = if (images.size > 1) "图片 ${index + 1}/${images.size}" else "图片预览"
+            )
+        }
+    }
+}
+
+@Composable
+private fun ScreenshotThumbnail(base64: String, compact: Boolean, label: String) {
     var fullSize by remember { mutableStateOf(false) }
 
     val bitmap = remember(base64) {
@@ -502,22 +521,30 @@ private fun ScreenshotThumbnail(base64: String) {
     }
 
     if (bitmap != null) {
-        val widthFraction = if (fullSize) 1f else 0.5f
+        val widthFraction = if (fullSize) 1f else if (compact) 0.32f else 0.5f
         val shape = RoundedCornerShape(8.dp)
 
-        Image(
-            bitmap = bitmap,
-            contentDescription = "截图",
-            contentScale = ContentScale.FillWidth,
-            modifier = Modifier
-                .fillMaxWidth(widthFraction)
-                .clip(shape)
-                .clickable { fullSize = !fullSize }
-        )
+        Column {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 4.dp)
+            )
+            Image(
+                bitmap = bitmap,
+                contentDescription = label,
+                contentScale = ContentScale.FillWidth,
+                modifier = Modifier
+                    .fillMaxWidth(widthFraction)
+                    .clip(shape)
+                    .clickable { fullSize = !fullSize }
+            )
+        }
     } else {
         Box(
             modifier = Modifier
-                .fillMaxWidth(0.5f)
+                .fillMaxWidth(if (compact) 0.32f else 0.5f)
                 .height(100.dp)
                 .clip(RoundedCornerShape(8.dp))
                 .background(MaterialTheme.colorScheme.surfaceContainerHighest),
