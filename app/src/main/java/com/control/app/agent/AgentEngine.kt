@@ -359,13 +359,6 @@ class AgentEngine(
         val stableKeypadPlan = parseStableKeypadPlan(voiceCommand)
 
         try {
-            if (stableKeypadPlan != null) {
-                tryExecuteStableKeypadBeforeCapture(stableKeypadPlan)?.let { fastPathResult ->
-                    resultMessage = fastPathResult
-                    fastPathHandled = true
-                }
-            }
-
             if (!fastPathHandled) {
             // System message
             val systemPrompt = promptManager.getPrompt(DefaultPrompts.PROMPT_KEY_SYSTEM)
@@ -386,9 +379,9 @@ class AgentEngine(
             setProgress(phaseTiming = initialCapture.timing)
 
             var effectiveCapture = initialCapture
-                if (stableKeypadPlan != null &&
-                    !hasStableKeypadCoverage(stableKeypadPlan, initialCapture.uiTreeResult)
-                ) {
+            if (stableKeypadPlan != null &&
+                !hasStableKeypadCoverage(stableKeypadPlan, initialCapture.uiTreeResult)
+            ) {
                 retryStableKeypadCapture(stableKeypadPlan, settings.screenshotScale)?.let { retryCapture ->
                     effectiveCapture = retryCapture
                 }
@@ -419,15 +412,15 @@ class AgentEngine(
                 )
             )
 
-                if (stableKeypadPlan != null && uiTreeResult != null) {
-                    tryExecuteStableKeypadFromUi(
-                        plan = stableKeypadPlan,
-                        uiTreeResult = uiTreeResult,
-                        verificationMode = StableKeypadVerificationMode.NONE
-                    )?.let { fastPathResult ->
-                        resultMessage = fastPathResult
-                        fastPathHandled = true
-                    }
+            if (stableKeypadPlan != null && uiTreeResult != null) {
+                tryExecuteStableKeypadFromUi(
+                    plan = stableKeypadPlan,
+                    uiTreeResult = uiTreeResult,
+                    verificationMode = StableKeypadVerificationMode.NONE
+                )?.let { fastPathResult ->
+                    resultMessage = fastPathResult
+                    fastPathHandled = true
+                }
             }
 
             if (fastPathHandled) {
@@ -1025,95 +1018,6 @@ class AgentEngine(
         val yFraction: Float
     )
 
-    private suspend fun tryExecuteFastPath(voiceCommand: String): String? {
-        val plan = parseStableKeypadPlan(voiceCommand) ?: return null
-        addLog(
-            DebugLogEntry(
-                type = DebugLogType.INFO,
-                title = "快速路径命中",
-                content = "识别到稳定键盘任务，尝试本地批量输入: ${plan.sequence}"
-            )
-        )
-        _overlayVisible.value = false
-        delay(150)
-        return try {
-            runCatching { executeStableKeypadFastPath(plan) }
-                .onFailure { error ->
-                    addLog(
-                        DebugLogEntry(
-                            type = DebugLogType.INFO,
-                            title = "快速路径回退",
-                            content = "稳定键盘快速路径失败，回退到通用 AI 流程: ${error.message}"
-                        )
-                    )
-                }
-                .getOrNull()
-        } finally {
-            _overlayVisible.value = true
-        }
-    }
-
-    private suspend fun tryExecuteStableKeypadBeforeCapture(plan: StableKeypadPlan): String? {
-        _overlayVisible.value = false
-        delay(150)
-        return try {
-            runCatching { executeStableKeypadFastPath(plan) }
-                .onFailure { error ->
-                    addLog(
-                        DebugLogEntry(
-                            type = DebugLogType.INFO,
-                            title = "快速路径回退",
-                            content = "稳定键盘前置快路径失败，回退到标准截图链路: ${error.message}"
-                        )
-                    )
-                }
-                .getOrNull()
-        } finally {
-            _overlayVisible.value = true
-        }
-    }
-
-    private suspend fun maybeLaunchStableKeypadTarget(plan: StableKeypadPlan) {
-        if (plan.launchCommand == null && plan.foregroundPackages.isEmpty()) return
-
-        val launchStartedAt = System.currentTimeMillis()
-        setProgress(
-            statusMessage = "快速路径: 正在准备稳定键盘",
-            activeTool = "stable_keypad_fast_path",
-            lastAction = "根据任务预先打开目标应用",
-            toolArguments = buildStableKeypadToolArguments(plan),
-            stepIntent = "先把目标应用切到前台，再用轻量 UI 树判断是否能直接批量输入"
-        )
-
-        val requestedTarget = when {
-            plan.launchCommand != null -> {
-                adbExecutor.executeCommand(plan.launchCommand).getOrThrow()
-                plan.launchCommand
-            }
-            else -> {
-                plan.foregroundPackages.firstOrNull { pkg ->
-                    adbExecutor.launchApp(pkg).isSuccess
-                } ?: throw IllegalStateException("无法启动目标应用: ${plan.foregroundPackages.joinToString()}")
-            }
-        }
-
-        if (plan.foregroundPackages.isNotEmpty()) {
-            waitForForegroundPackage(
-                packages = plan.foregroundPackages.toSet(),
-                timeoutMs = CALCULATOR_APP_FOREGROUND_TIMEOUT_MS
-            ) ?: throw IllegalStateException(
-                "目标应用未进入前台，启动目标 $requestedTarget，当前前台 ${currentForegroundPackage().ifBlank { "unknown" }}"
-            )
-        }
-
-        setProgress(
-            phaseTiming = TimingBreakdown(
-                toolMs = (System.currentTimeMillis() - launchStartedAt).coerceAtLeast(0L)
-            )
-        )
-        delay(CALCULATOR_UI_STABILIZE_DELAY_MS)
-    }
-
     private suspend fun tryExecuteStableKeypadFromUi(
         plan: StableKeypadPlan,
         uiTreeResult: UiTreeResult,
@@ -1259,13 +1163,6 @@ class AgentEngine(
         NONE
     }
 
-    private data class StableKeypadSnapshot(
-        val packageName: String,
-        val activeText: String,
-        val visibleTexts: List<String>,
-        val tokenCenters: Map<String, Pair<Int, Int>>
-    )
-
     private fun parseStableKeypadPlan(command: String): StableKeypadPlan? {
         val lower = command.lowercase(Locale.ROOT)
         val explicitSequence = Regex("""(?:输入|键入|拨打|拨号|input|dial)\s*([0-9+\-*/xX×÷.=#]+)""")
@@ -1305,78 +1202,6 @@ class AgentEngine(
             sequence = normalizedSequence,
             launchCommand = inferredTarget?.launchCommand
         )
-    }
-
-    private suspend fun executeStableKeypadFastPath(plan: StableKeypadPlan): String {
-        maybeLaunchStableKeypadTarget(plan)
-
-        val initialSnapshot = dumpStableKeypadSnapshotWithRetry()
-        if (!plan.sequence.all { token -> initialSnapshot.tokenCenters.containsKey(token.toString()) }) {
-            throw IllegalStateException("当前界面未提供完整键位，无法本地批量输入 ${plan.sequence}")
-        }
-
-        maybeClearStableKeypadInput(initialSnapshot)
-
-        val tapStartedAt = System.currentTimeMillis()
-        plan.sequence.forEachIndexed { index, ch ->
-            val coords = initialSnapshot.tokenCenters[ch.toString()]
-                ?: throw IllegalStateException("找不到键位 '$ch'")
-            adbExecutor.tap(coords.first, coords.second).getOrThrow()
-            if (index != plan.sequence.lastIndex) {
-                delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
-            }
-        }
-        setProgress(
-            statusMessage = "快速路径: 已输入表达式",
-            activeTool = "stable_keypad_fast_path",
-            lastAction = "已本地输入 ${plan.sequence}",
-            toolArguments = buildStableKeypadToolArguments(plan, initialSnapshot.packageName),
-            stepIntent = "基于当前 UI 树识别出的稳定键盘，批量点击完整序列",
-            phaseTiming = TimingBreakdown(
-                toolMs = (System.currentTimeMillis() - tapStartedAt).coerceAtLeast(0L)
-            )
-        )
-
-        delay(200)
-        val verifiedSnapshot = runCatching { dumpStableKeypadSnapshotWithRetry() }.getOrNull()
-        if (verifiedSnapshot != null &&
-            verifiedSnapshot.activeText.isNotBlank() &&
-            !verifiedSnapshot.activeText.contains(plan.sequence) &&
-            verifiedSnapshot.visibleTexts.none { it.contains(plan.sequence) }
-        ) {
-            throw IllegalStateException("本地批量输入后未在界面上看到目标序列 ${plan.sequence}")
-        }
-
-        addLog(
-            DebugLogEntry(
-                type = DebugLogType.ACTION_EXECUTED,
-                title = "执行: stable_keypad_fast_path",
-                content = buildString {
-                    appendLine("package=${verifiedSnapshot?.packageName ?: initialSnapshot.packageName}")
-                    appendLine("sequence=${plan.sequence}")
-                    append("activeText=${verifiedSnapshot?.activeText?.ifBlank { "(unverified)" } ?: "(unverified)"}")
-                }
-            )
-        )
-
-        return "任务完成：已通过稳定键盘快速输入 ${plan.sequence}"
-    }
-
-    private suspend fun maybeClearStableKeypadInput(snapshot: StableKeypadSnapshot) {
-        val currentValue = snapshot.activeText.trim()
-        if (currentValue.isBlank() || currentValue == "0") return
-
-        snapshot.tokenCenters["CLEAR"]?.let { (x, y) ->
-            adbExecutor.tap(x, y).getOrThrow()
-            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
-            return
-        }
-
-        val backspace = snapshot.tokenCenters["BACKSPACE"] ?: return
-        repeat(currentValue.length.coerceAtMost(20)) {
-            adbExecutor.tap(backspace.first, backspace.second).getOrThrow()
-            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
-        }
     }
 
     private fun canClearStableKeypadInput(uiTreeResult: UiTreeResult): Boolean {
@@ -1419,109 +1244,6 @@ class AgentEngine(
             adbExecutor.tap(x, y).getOrThrow()
             delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
         }
-    }
-
-    private fun buildStableKeypadSnapshot(uiTreeResult: UiTreeResult): StableKeypadSnapshot? {
-        if (uiTreeResult.tokenElementMap.isEmpty()) return null
-        val tokenCenters = buildMap {
-            uiTreeResult.tokenElementMap.forEach { (token, elementId) ->
-                uiTreeResult.elementMap[elementId]?.let { put(token, it) }
-            }
-        }
-        if (tokenCenters.isEmpty()) return null
-        return StableKeypadSnapshot(
-            packageName = uiTreeResult.packageName,
-            activeText = uiTreeResult.activeText,
-            visibleTexts = uiTreeResult.visibleTexts,
-            tokenCenters = tokenCenters
-        )
-    }
-
-    private suspend fun dumpStableKeypadSnapshotWithRetry(): StableKeypadSnapshot {
-        var lastError: Throwable? = null
-        repeat(CALCULATOR_UI_MAX_ATTEMPTS) { attempt ->
-            try {
-                captureAccessibilityUiTree()?.let { accessibilityTree ->
-                    return buildStableKeypadSnapshot(accessibilityTree)
-                        ?: throw IllegalStateException("无法识别当前稳定键盘")
-                }
-                val rawXml = adbExecutor.dumpUiHierarchy().getOrThrow()
-                return parseStableKeypadSnapshot(rawXml)
-                    ?: throw IllegalStateException("无法识别当前稳定键盘")
-            } catch (error: Throwable) {
-                lastError = error
-                if (attempt != CALCULATOR_UI_MAX_ATTEMPTS - 1) {
-                    delay(CALCULATOR_UI_RETRY_DELAY_MS)
-                }
-            }
-        }
-        throw IllegalStateException(
-            "稳定键盘快速路径抓取界面失败，已重试 $CALCULATOR_UI_MAX_ATTEMPTS 次",
-            lastError
-        )
-    }
-
-    private fun parseStableKeypadSnapshot(xml: String): StableKeypadSnapshot? {
-        val boundsRegex = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
-        val nodeRegex = Regex("""<node\s+([^>]+?)/?>\s*""")
-        val attrRegex = Regex("""(\w[\w-]*)="([^"]*?)"""")
-
-        var packageName = ""
-        var activeText = ""
-        val visibleTexts = linkedSetOf<String>()
-        val tokenCenters = linkedMapOf<String, Pair<Int, Int>>()
-
-        for (nodeMatch in nodeRegex.findAll(xml)) {
-            val attrs = mutableMapOf<String, String>()
-            for (attrMatch in attrRegex.findAll(nodeMatch.groupValues[1])) {
-                attrs[attrMatch.groupValues[1]] = attrMatch.groupValues[2]
-            }
-
-            if (packageName.isBlank()) {
-                packageName = attrs["package"].orEmpty()
-            }
-
-            val resourceId = (attrs["resource-id"] ?: "").substringAfterLast("/")
-            val text = attrs["text"].orEmpty()
-            val contentDesc = attrs["content-desc"].orEmpty()
-            val className = attrs["class"].orEmpty()
-            val clickable = attrs["clickable"] == "true"
-            val focusable = attrs["focusable"] == "true"
-            val focused = attrs["focused"] == "true"
-            val enabled = attrs["enabled"] != "false"
-
-            if (text.isNotBlank()) visibleTexts += text
-            if (contentDesc.isNotBlank()) visibleTexts += contentDesc
-            if ((focused || className.contains("EditText")) && text.isNotBlank()) {
-                activeText = text
-            }
-
-            val bounds = attrs["bounds"] ?: continue
-            val boundsMatch = boundsRegex.find(bounds) ?: continue
-            val center = Pair(
-                (boundsMatch.groupValues[1].toInt() + boundsMatch.groupValues[3].toInt()) / 2,
-                (boundsMatch.groupValues[2].toInt() + boundsMatch.groupValues[4].toInt()) / 2
-            )
-
-            val token = deriveStableKeypadToken(resourceId, text, contentDesc) ?: continue
-            if (!enabled) continue
-            if (!clickable && !focusable && token !in setOf(
-                    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
-                    "+", "-", "*", "/", ".", "#", "=", "CLEAR", "BACKSPACE"
-                )
-            ) {
-                continue
-            }
-            tokenCenters[token] = center
-        }
-
-        if (tokenCenters.isEmpty()) return null
-        return StableKeypadSnapshot(
-            packageName = packageName,
-            activeText = activeText,
-            visibleTexts = visibleTexts.toList(),
-            tokenCenters = tokenCenters
-        )
     }
 
     private fun deriveStableKeypadToken(

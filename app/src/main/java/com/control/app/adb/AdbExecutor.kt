@@ -1,5 +1,8 @@
 package com.control.app.adb
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ComponentName
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -40,6 +43,8 @@ class AdbExecutor(private val context: Context) {
         private const val UI_DUMP_READ_TIMEOUT_MS = 5_000L
         private const val ACCESSIBILITY_INPUT_RETRY_COUNT = 4
         private const val ACCESSIBILITY_INPUT_RETRY_DELAY_MS = 120L
+        private const val ACCESSIBILITY_ENABLE_WAIT_RETRY_COUNT = 20
+        private const val ACCESSIBILITY_ENABLE_WAIT_RETRY_DELAY_MS = 250L
     }
 
     private val connectionManager: AdbConnectionManagerImpl by lazy {
@@ -409,39 +414,104 @@ class AdbExecutor(private val context: Context) {
             }
 
             val hasAdbKeyboard = imeList.contains("com.android.adbkeyboard")
-
-            if (hasAdbKeyboard) {
-                inputTextWithAdbKeyboard(text)
+            val hasAccessibilityService = if (!text.isAsciiOnly() && !hasAdbKeyboard) {
+                ensureAccessibilityServiceForUnicodeInput()
             } else {
-                val isAscii = text.all { it.code in 0..127 }
-                if (isAscii) {
-                    executeCommand("input text \"${escapeAsciiInputText(text)}\"").getOrThrow()
-                } else {
-                    Log.w(TAG, "Non-ASCII without ADBKeyboard, using clipboard fallback")
-                    try {
-                        inputTextViaClipboard(text)
-                    } catch (clipboardError: Exception) {
-                        if (UiTreeAccessibilityService.isConnected.value) {
-                            Log.w(TAG, "Clipboard fallback unavailable, trying accessibility text injection")
-                            runCatching {
-                                inputTextViaAccessibility(text)
-                            }.getOrElse { accessibilityError ->
-                                clipboardError.addSuppressed(accessibilityError)
-                                throw clipboardError
-                            }
-                        } else {
-                            throw clipboardError
-                        }
-                    }
-                }
+                UiTreeAccessibilityService.isConnected.value
             }
+
+            val routes = planTextInputRoutes(
+                text = text,
+                capabilities = TextInputCapabilities(
+                    hasAdbKeyboard = hasAdbKeyboard,
+                    hasAccessibilityService = hasAccessibilityService
+                )
+            )
+
+            Log.d(TAG, "Text input routes: ${routes.joinToString()}")
+
+            var firstFailure: Throwable? = null
+            routes.forEach { route ->
+                val result = runCatching { executeTextInputRoute(route, text) }
+                if (result.isSuccess) {
+                    return@runCatching result.getOrThrow()
+                }
+
+                val failure = result.exceptionOrNull() ?: return@forEach
+                if (firstFailure == null) {
+                    firstFailure = failure
+                } else if (firstFailure !== failure) {
+                    firstFailure?.addSuppressed(failure)
+                }
+                Log.w(TAG, "Text input route $route failed: ${failure.message}")
+            }
+
+            throw RuntimeException("Unable to input text with available strategies", firstFailure)
         }
+    }
+
+    private suspend fun executeTextInputRoute(route: TextInputRoute, text: String): String {
+        return when (route) {
+            TextInputRoute.ADB_KEYBOARD -> inputTextWithAdbKeyboard(text)
+            TextInputRoute.ASCII_SHELL -> {
+                executeCommand("input text \"${escapeAsciiInputText(text)}\"").getOrThrow()
+                "input via shell: $text"
+            }
+            TextInputRoute.ACCESSIBILITY -> inputTextViaAccessibility(text)
+            TextInputRoute.CLIPBOARD -> inputTextViaClipboard(text)
+        }
+    }
+
+    private suspend fun ensureAccessibilityServiceForUnicodeInput(): Boolean {
+        if (UiTreeAccessibilityService.isConnected.value) {
+            return true
+        }
+
+        val component = ComponentName(context, UiTreeAccessibilityService::class.java).flattenToString()
+        val enabledServices = runCatching {
+            executeCommand("settings get secure enabled_accessibility_services").getOrDefault("")
+        }.getOrDefault("")
+            .trim()
+            .takeUnless { it.equals("null", ignoreCase = true) }
+            .orEmpty()
+
+        val mergedServices = buildList<String> {
+            enabledServices
+                .split(':')
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .forEach { add(it) }
+            if (none { it.equals(component, ignoreCase = true) }) {
+                add(component)
+            }
+        }.joinToString(":")
+
+        runCatching {
+            Log.d(TAG, "Enabling accessibility service for Unicode input: $component")
+            executeCommand(
+                "settings put secure enabled_accessibility_services ${shellSingleQuote(mergedServices)}"
+            ).getOrThrow()
+            executeCommand("settings put secure accessibility_enabled 1").getOrThrow()
+        }.onFailure { error ->
+            Log.w(TAG, "Unable to enable accessibility service automatically: ${error.message}")
+            return false
+        }
+
+        repeat(ACCESSIBILITY_ENABLE_WAIT_RETRY_COUNT) {
+            if (UiTreeAccessibilityService.isConnected.value) {
+                return true
+            }
+            delay(ACCESSIBILITY_ENABLE_WAIT_RETRY_DELAY_MS)
+        }
+
+        Log.w(TAG, "Accessibility service did not connect in time for Unicode input")
+        return UiTreeAccessibilityService.isConnected.value
     }
 
     private suspend fun inputTextWithAdbKeyboard(text: String): String {
         executeCommand("ime set com.android.adbkeyboard/.AdbIME").getOrThrow()
 
-        val message = if (text.all { it.code in 0..127 }) {
+        val message = if (text.isAsciiOnly()) {
             "am broadcast -a ADB_INPUT_TEXT --es msg ${shellSingleQuote(text)}"
         } else {
             val encoded = Base64.encodeToString(text.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
@@ -453,17 +523,45 @@ class AdbExecutor(private val context: Context) {
     }
 
     private suspend fun inputTextViaClipboard(text: String): String {
+        val clipboardManager = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            ?: throw RuntimeException("Clipboard service is unavailable")
+
+        var clipboardFailure: Throwable? = runCatching {
+            clipboardManager.setPrimaryClip(ClipData.newPlainText("control-input", text))
+        }.exceptionOrNull()
+
+        if (clipboardFailure != null) {
+            Log.w(TAG, "Local clipboard set failed: ${clipboardFailure.message}")
+        }
+
+        if (clipboardFailure == null) {
+            delay(80L)
+            runCatching {
+                pasteClipboardContent()
+            }.onSuccess {
+                return "input via clipboard manager: $text"
+            }.onFailure { pasteFailure ->
+                Log.w(TAG, "Local clipboard paste failed: ${pasteFailure.message}")
+                clipboardFailure = pasteFailure
+            }
+        }
+
         val clipboardCommands = listOf(
             "cmd clipboard set text ${shellSingleQuote(text)}",
             "cmd clipboard set ${shellSingleQuote(text)}",
             "am broadcast -a clipper.set -e text ${shellSingleQuote(text)}"
         )
 
-        var lastFailure: Throwable? = null
+        var shellClipboardFailure: Throwable? = clipboardFailure
         for (command in clipboardCommands) {
             val output = runCatching { executeCommand(command).getOrThrow() }
             if (output.isFailure) {
-                lastFailure = output.exceptionOrNull()
+                val failure = output.exceptionOrNull()
+                if (shellClipboardFailure == null) {
+                    shellClipboardFailure = failure
+                } else if (failure != null && shellClipboardFailure !== failure) {
+                    shellClipboardFailure.addSuppressed(failure)
+                }
                 continue
             }
 
@@ -471,19 +569,24 @@ class AdbExecutor(private val context: Context) {
                 continue
             }
 
-            runCatching {
-                executeCommand("input keyevent 279").getOrThrow()
-            }.recoverCatching {
-                executeCommand("input keyevent --meta 28672 50").getOrThrow()
-            }.getOrThrow()
-
-            return "input via clipboard: $text"
+            pasteClipboardContent()
+            return "input via shell clipboard: $text"
         }
 
         throw RuntimeException(
-            "Unicode text input requires ADBKeyboard, a clipboard service that supports shell paste, or the app accessibility service",
-            lastFailure
+            "Unicode text input requires ADBKeyboard, a working clipboard paste path, or the app accessibility service",
+            shellClipboardFailure
         )
+    }
+
+    private suspend fun pasteClipboardContent() {
+        runCatching {
+            executeCommand("input keyevent 279").getOrThrow()
+        }.recoverCatching {
+            executeCommand("input keycombination 113 50").getOrThrow()
+        }.recoverCatching {
+            executeCommand("input keyevent --meta 28672 50").getOrThrow()
+        }.getOrThrow()
     }
 
     private suspend fun inputTextViaAccessibility(text: String): String {

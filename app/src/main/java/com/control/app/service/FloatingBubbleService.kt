@@ -443,9 +443,7 @@ class FloatingBubbleService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-        }
+        ).apply { configureFullscreenOverlayLayout(this) }
         edgeGlowOverlay?.isClickable = false
         edgeGlowOverlay?.isFocusable = false
 
@@ -506,11 +504,23 @@ class FloatingBubbleService : Service() {
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
-        ).apply {
-            gravity = Gravity.TOP or Gravity.START
-        }
+        ).apply { configureFullscreenOverlayLayout(this) }
 
         windowManager.addView(gestureCueOverlay, params)
+    }
+
+    private fun configureFullscreenOverlayLayout(params: WindowManager.LayoutParams) {
+        params.gravity = Gravity.TOP or Gravity.START
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            params.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Draw into the full physical display instead of reserving gesture/nav insets.
+            params.setFitInsetsTypes(0)
+            params.setFitInsetsSides(0)
+            params.setFitInsetsIgnoringVisibility(true)
+        }
     }
 
     private fun shouldShowAutomationCue(): Boolean {

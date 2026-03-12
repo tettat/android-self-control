@@ -326,6 +326,49 @@ tasks.register("installAndLaunchDebug") {
     }
 }
 
+tasks.register("reinstallAndRestartDebug") {
+    group = "install"
+    description = "Builds, reinstalls, force-stops, and restarts the debug app on the target device."
+    dependsOn("installDebugFast")
+
+    doLast {
+        val adbExecutable = adbExecutableProvider.get()
+        val serial = resolveTargetDeviceSerial(adbExecutable)
+        logger.lifecycle("Force-stopping $debugApplicationId on $serial")
+
+        exec {
+            commandLine(
+                adbExecutable,
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "force-stop",
+                debugApplicationId
+            )
+        }
+
+        logger.lifecycle("Restarting $debugLaunchComponent on $serial")
+
+        exec {
+            commandLine(
+                adbExecutable,
+                "-s",
+                serial,
+                "shell",
+                "am",
+                "start",
+                "-n",
+                debugLaunchComponent,
+                "-a",
+                "android.intent.action.MAIN",
+                "-c",
+                "android.intent.category.LAUNCHER"
+            )
+        }
+    }
+}
+
 dependencies {
     // Compose BOM
     val composeBom = platform("androidx.compose:compose-bom:2024.02.00")

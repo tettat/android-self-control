@@ -173,6 +173,223 @@ const logsHtml = `<!DOCTYPE html>
     display: grid;
     gap: 12px;
   }
+  .section-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: baseline;
+    margin: 18px 0 12px;
+  }
+  .section-head h2 {
+    margin: 0;
+    font-size: 18px;
+  }
+  .overview {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 12px;
+    margin-top: 16px;
+  }
+  .stat-card, .insight-card, .raw-panel, .session-shell, .session-event-card {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(144, 202, 249, 0.12);
+    border-radius: 16px;
+  }
+  .stat-card {
+    padding: 14px;
+  }
+  .stat-label {
+    color: #90a4ae;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .stat-value {
+    font-size: 28px;
+    line-height: 1;
+    font-weight: 700;
+    margin-bottom: 6px;
+  }
+  .stat-note {
+    color: #90a4ae;
+    font-size: 12px;
+  }
+  .insight-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 16px;
+    margin-top: 16px;
+  }
+  .insight-card {
+    padding: 16px;
+  }
+  .insight-card h2 {
+    margin: 0 0 6px;
+    font-size: 16px;
+  }
+  .session-shell {
+    padding: 18px;
+    margin-top: 16px;
+    background:
+      radial-gradient(circle at top right, rgba(66,165,245,0.14), transparent 34%),
+      rgba(255,255,255,0.03);
+  }
+  .session-topline {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .session-title {
+    font-size: 20px;
+    font-weight: 700;
+  }
+  .session-status {
+    padding: 6px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: rgba(129, 199, 132, 0.16);
+    color: #81c784;
+  }
+  .session-status.running { animation: pulseGlow 1.8s ease-in-out infinite; }
+  .session-meta-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 10px;
+    margin-bottom: 18px;
+  }
+  .session-meta-card {
+    padding: 12px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(144, 202, 249, 0.08);
+  }
+  .session-meta-card strong {
+    display: block;
+    margin-top: 6px;
+    font-size: 18px;
+  }
+  .flow-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 12px;
+  }
+  .flow-stage {
+    position: relative;
+    overflow: hidden;
+    padding: 14px;
+    border-radius: 14px;
+    border: 1px solid rgba(144, 202, 249, 0.14);
+    background: rgba(12, 22, 31, 0.72);
+  }
+  .flow-stage::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    background: linear-gradient(120deg, transparent 0%, rgba(66,165,245,0.2) 48%, transparent 100%);
+    transform: translateX(-120%);
+  }
+  .flow-stage.running::before {
+    opacity: 1;
+    animation: stageSweep 2.4s linear infinite;
+  }
+  .flow-stage.done { border-color: rgba(129, 199, 132, 0.25); }
+  .flow-stage.pending { opacity: 0.72; }
+  .flow-index {
+    display: inline-flex;
+    width: 28px;
+    height: 28px;
+    align-items: center;
+    justify-content: center;
+    border-radius: 999px;
+    background: #607d8b;
+    color: #fff;
+    font-weight: 700;
+    font-size: 12px;
+    margin-bottom: 10px;
+  }
+  .flow-stage.done .flow-index,
+  .flow-stage.running .flow-index { background: #42a5f5; }
+  .flow-stage h3 {
+    margin: 0 0 6px;
+    font-size: 15px;
+  }
+  .flow-caption {
+    font-size: 13px;
+    color: #b0bec5;
+    line-height: 1.5;
+  }
+  .flow-tag {
+    display: inline-block;
+    margin-top: 10px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    font-size: 12px;
+    background: rgba(255,255,255,0.08);
+  }
+  .session-event-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    margin-top: 18px;
+  }
+  .session-event-card {
+    padding: 14px;
+    background: rgba(12, 22, 31, 0.72);
+  }
+  .session-event-card h3 {
+    margin: 0 0 8px;
+    font-size: 14px;
+  }
+  .chart, .timeline {
+    display: grid;
+    gap: 10px;
+    margin-top: 14px;
+  }
+  .chart-row {
+    display: grid;
+    grid-template-columns: minmax(88px, 120px) minmax(0, 1fr) auto;
+    gap: 10px;
+    align-items: center;
+    font-size: 13px;
+  }
+  .chart-track {
+    height: 10px;
+    border-radius: 999px;
+    background: rgba(255,255,255,0.08);
+    overflow: hidden;
+  }
+  .chart-fill {
+    height: 100%;
+    border-radius: 999px;
+    background: linear-gradient(90deg, #42a5f5 0%, #26c6da 100%);
+  }
+  .timeline-item {
+    padding: 12px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(144, 202, 249, 0.1);
+  }
+  .timeline-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    align-items: baseline;
+    margin-bottom: 6px;
+  }
+  .timeline-title {
+    font-size: 14px;
+    font-weight: 600;
+  }
+  .timeline-snippet {
+    font-size: 13px;
+    color: #b0bec5;
+  }
+  .timeline-empty {
+    color: #90a4ae;
+    font-size: 13px;
+  }
   .control-panel {
     margin-top: 16px;
     padding: 16px;
@@ -237,7 +454,20 @@ const logsHtml = `<!DOCTYPE html>
     color: #ef9a9a;
   }
   .entry {
+    padding: 0;
+    overflow: hidden;
+  }
+  .entry summary {
+    list-style: none;
+    cursor: pointer;
     padding: 14px;
+  }
+  .entry summary::-webkit-details-marker {
+    display: none;
+  }
+  .entry-body {
+    padding: 0 14px 14px;
+    border-top: 1px solid rgba(144, 202, 249, 0.1);
   }
   .entry h3 {
     margin: 0 0 8px;
@@ -257,6 +487,31 @@ const logsHtml = `<!DOCTYPE html>
     background: rgba(255,255,255,0.08);
     font-size: 12px;
     margin-right: 8px;
+  }
+  .raw-panel {
+    margin-top: 16px;
+    overflow: hidden;
+  }
+  .raw-panel summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 16px;
+    font-weight: 600;
+  }
+  .raw-panel summary::-webkit-details-marker {
+    display: none;
+  }
+  .raw-content {
+    padding: 0 16px 16px;
+    border-top: 1px solid rgba(144, 202, 249, 0.12);
+  }
+  @keyframes stageSweep {
+    from { transform: translateX(-120%); }
+    to { transform: translateX(120%); }
+  }
+  @keyframes pulseGlow {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(66,165,245,0.18); }
+    50% { box-shadow: 0 0 0 8px rgba(66,165,245,0); }
   }
   .auto-refresh-row {
     display: flex;
@@ -289,6 +544,7 @@ const logsHtml = `<!DOCTYPE html>
   a { color: #90caf9; }
   @media (max-width: 900px) {
     .grid { grid-template-columns: 1fr; }
+    .insight-grid { grid-template-columns: 1fr; }
     .control-row { flex-direction: column; }
     .control-button { min-height: 48px; width: 100%; }
   }
@@ -325,7 +581,34 @@ const logsHtml = `<!DOCTYPE html>
         <div id="commandFeedback" class="meta control-feedback"></div>
         <div id="controlHint" class="meta"></div>
       </div>
-      <div id="entries" class="entries" style="margin-top: 16px;"></div>
+      <div class="section-head">
+        <h2>数据大盘</h2>
+        <div class="meta">聚合统计，用来看整体运行健康度。</div>
+      </div>
+      <div id="overview" class="overview"></div>
+      <div class="insight-grid">
+        <section class="insight-card">
+          <h2>日志分布</h2>
+          <div class="meta">优先展示结构化摘要，不默认摊开原始内容。</div>
+          <div id="distribution" class="chart"></div>
+        </section>
+        <section class="insight-card">
+          <h2>最近动态</h2>
+          <div class="meta">最近几条关键日志的压缩时间线。</div>
+          <div id="timeline" class="timeline"></div>
+        </section>
+      </div>
+      <div class="section-head">
+        <h2>当前会话详情</h2>
+        <div class="meta">把当前执行情况拆成有语义的阶段流程。</div>
+      </div>
+      <section id="sessionBoard" class="session-shell"></section>
+      <details class="raw-panel">
+        <summary>查看原始日志</summary>
+        <div class="raw-content">
+          <div id="entries" class="entries"></div>
+        </div>
+      </details>
     </section>
   </div>
 </div>
@@ -333,11 +616,20 @@ const logsHtml = `<!DOCTYPE html>
 <script>
 const AUTO_REFRESH_KEY = 'control-logs-autoRefresh';
 const REFRESH_INTERVAL_MS = 5000;
+const TYPE_LABELS = {
+  ACTION_EXECUTED: '执行动作',
+  API_REQUEST: '请求模型',
+  API_RESPONSE: '模型响应',
+  SCREENSHOT: '截图',
+  ERROR: '异常',
+  INFO: '信息',
+  VOICE_INPUT: '语音输入'
+};
 
 const state = {
   selectedId: null,
   timer: null,
-  autoRefresh: true,
+  autoRefresh: false,
   selectedSnapshot: null,
   controlBaseUrl: '',
   commandInFlight: false,
@@ -346,8 +638,8 @@ const state = {
 function getStoredAutoRefresh() {
   try {
     const v = localStorage.getItem(AUTO_REFRESH_KEY);
-    return v === null ? true : v === 'true';
-  } catch (_) { return true; }
+    return v === null ? false : v === 'true';
+  } catch (_) { return false; }
 }
 
 function setStoredAutoRefresh(on) {
@@ -381,6 +673,30 @@ function escapeHtml(value) {
 
 function normalizeBaseUrl(url) {
   return String(url || '').replace(/\\/+$/, '');
+}
+
+function summarizeText(value, maxLength) {
+  const compact = String(value || '').replace(/\\s+/g, ' ').trim();
+  if (!compact) return '无附加内容';
+  return compact.length > maxLength ? compact.slice(0, maxLength - 1) + '…' : compact;
+}
+
+function formatType(type) {
+  return TYPE_LABELS[type] || type || '未知';
+}
+
+function buildTypeCounts(entries) {
+  const counts = {};
+  (entries || []).forEach(entry => {
+    const key = String(entry.type || 'UNKNOWN');
+    counts[key] = (counts[key] || 0) + 1;
+  });
+  return counts;
+}
+
+function findLatestEntry(entries, matcher) {
+  const reversed = (entries || []).slice().reverse();
+  return reversed.find(matcher) || null;
 }
 
 function setFeedback(message, tone) {
@@ -445,6 +761,9 @@ async function loadDevices() {
     await loadDevice(state.selectedId);
   } else {
     document.getElementById('summary').textContent = '暂无设备日志';
+    document.getElementById('overview').innerHTML = '';
+    document.getElementById('distribution').innerHTML = '';
+    document.getElementById('timeline').innerHTML = '';
     document.getElementById('entries').innerHTML = '';
     state.selectedSnapshot = null;
     state.controlBaseUrl = '';
@@ -472,6 +791,9 @@ async function loadDevice(deviceId) {
   const res = await fetch('/api/device-logs/' + encodeURIComponent(deviceId));
   if (!res.ok) {
     document.getElementById('summary').textContent = '设备日志不存在或已过期';
+    document.getElementById('overview').innerHTML = '';
+    document.getElementById('distribution').innerHTML = '';
+    document.getElementById('timeline').innerHTML = '';
     document.getElementById('entries').innerHTML = '';
     state.selectedSnapshot = null;
     state.controlBaseUrl = '';
@@ -497,13 +819,189 @@ function renderDevice(snapshot) {
   updateControlUi();
 
   const entries = snapshot.entries || [];
+  renderOverview(snapshot, entries);
+  renderDistribution(entries);
+  renderTimeline(entries);
+  renderSessionBoard(snapshot, entries);
   document.getElementById('entries').innerHTML = entries.slice().reverse().map(entry => (
-    '<article class="entry">' +
-      '<div><span class="pill">' + escapeHtml(entry.type) + '</span><span class="meta">' + escapeHtml(entry.timestampFormatted) + '</span></div>' +
-      '<h3>' + escapeHtml(entry.title) + '</h3>' +
-      '<pre>' + escapeHtml(entry.content) + '</pre>' +
+    '<details class="entry">' +
+      '<summary>' +
+        '<div><span class="pill">' + escapeHtml(formatType(entry.type)) + '</span><span class="meta">' + escapeHtml(entry.timestampFormatted) + '</span></div>' +
+        '<h3>' + escapeHtml(entry.title) + '</h3>' +
+        '<div class="meta">' + escapeHtml(summarizeText(entry.content, 120)) + '</div>' +
+      '</summary>' +
+      '<div class="entry-body"><pre>' + escapeHtml(entry.content) + '</pre></div>' +
+    '</details>'
+  )).join('');
+}
+
+function renderOverview(snapshot, entries) {
+  const stateInfo = snapshot.agentState || {};
+  const counts = buildTypeCounts(entries);
+  const cards = [
+    {
+      label: '当前状态',
+      value: stateInfo.isRunning ? '执行中' : '空闲',
+      note: stateInfo.statusMessage || '暂无状态信息'
+    },
+    {
+      label: '同步日志',
+      value: String(entries.length),
+      note: '当前设备最近快照'
+    },
+    {
+      label: '执行动作',
+      value: String(counts.ACTION_EXECUTED || 0),
+      note: '点击、输入、滚动等'
+    },
+    {
+      label: '异常数量',
+      value: String(counts.ERROR || 0),
+      note: (counts.ERROR || 0) > 0 ? '建议优先排查' : '当前未发现异常'
+    }
+  ];
+  document.getElementById('overview').innerHTML = cards.map(card => (
+    '<article class="stat-card">' +
+      '<div class="stat-label">' + escapeHtml(card.label) + '</div>' +
+      '<div class="stat-value">' + escapeHtml(card.value) + '</div>' +
+      '<div class="stat-note">' + escapeHtml(card.note) + '</div>' +
     '</article>'
   )).join('');
+}
+
+function renderDistribution(entries) {
+  const counts = Object.entries(buildTypeCounts(entries)).sort((a, b) => b[1] - a[1]);
+  const container = document.getElementById('distribution');
+  if (!counts.length) {
+    container.innerHTML = '<div class="timeline-empty">暂无可统计的日志类型</div>';
+    return;
+  }
+  const max = counts[0][1] || 1;
+  container.innerHTML = counts.map(([type, count]) => {
+    const width = Math.max((count / max) * 100, count > 0 ? 8 : 0);
+    return '<div class="chart-row">' +
+      '<div>' + escapeHtml(formatType(type)) + '</div>' +
+      '<div class="chart-track"><div class="chart-fill" style="width:' + width.toFixed(1) + '%"></div></div>' +
+      '<div>' + count + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function renderTimeline(entries) {
+  const container = document.getElementById('timeline');
+  const items = (entries || []).slice().reverse().slice(0, 6);
+  if (!items.length) {
+    container.innerHTML = '<div class="timeline-empty">暂无最近动态</div>';
+    return;
+  }
+  container.innerHTML = items.map(entry => (
+    '<article class="timeline-item">' +
+      '<div class="timeline-top">' +
+        '<div class="timeline-title">' + escapeHtml(entry.title || formatType(entry.type)) + '</div>' +
+        '<div class="meta">' + escapeHtml(entry.timestampFormatted) + '</div>' +
+      '</div>' +
+      '<div class="timeline-snippet">' + escapeHtml(summarizeText(entry.content, 110)) + '</div>' +
+    '</article>'
+  )).join('');
+}
+
+function buildSessionFlow(snapshot, entries) {
+  const stateInfo = snapshot.agentState || {};
+  const stepTimings = stateInfo.stepTimings || [];
+  const voiceEntry = findLatestEntry(entries, entry => entry.type === 'VOICE_INPUT' || /手动指令|语音/i.test(String(entry.title || '')));
+  const screenEntry = findLatestEntry(entries, entry => entry.type === 'SCREENSHOT');
+  const aiEntry = findLatestEntry(entries, entry => entry.type === 'API_RESPONSE' || entry.type === 'API_REQUEST');
+  const actionEntry = findLatestEntry(entries, entry => entry.type === 'ACTION_EXECUTED');
+  const errorEntry = findLatestEntry(entries, entry => entry.type === 'ERROR');
+  const stages = [
+    {
+      title: '接收指令',
+      detail: summarizeText((voiceEntry && (voiceEntry.content || voiceEntry.title)) || stateInfo.lastAction || '等待新的输入', 72),
+      completed: !!voiceEntry || !!stateInfo.taskStartedAtMs
+    },
+    {
+      title: '理解界面',
+      detail: summarizeText((screenEntry && (screenEntry.title || screenEntry.content)) || '尚未进入截图分析', 72),
+      completed: !!screenEntry || stepTimings.some(step => /截图/.test(String(step.label || '')))
+    },
+    {
+      title: '规划动作',
+      detail: summarizeText((aiEntry && (aiEntry.title || aiEntry.content)) || stateInfo.lastThinking || '等待模型决策', 72),
+      completed: !!aiEntry || stepTimings.some(step => /ai|模型/i.test(String(step.label || '') + ' ' + String(step.tool || '')))
+    },
+    {
+      title: '执行操作',
+      detail: summarizeText((actionEntry && (actionEntry.title || actionEntry.content)) || stateInfo.activeTool || '尚未执行具体动作', 72),
+      completed: !!actionEntry || stepTimings.some(step => !!step.tool)
+    },
+    {
+      title: errorEntry ? '异常处理' : '完成收尾',
+      detail: summarizeText((errorEntry && errorEntry.content) || stateInfo.statusMessage || '等待最终状态', 72),
+      completed: !stateInfo.isRunning && (!!stateInfo.lastProgressAtMs || !!errorEntry),
+      forceRunning: !!errorEntry && stateInfo.isRunning
+    }
+  ];
+  const activeIndex = stages.findIndex(stage => !stage.completed);
+  return stages.map((stage, index) => Object.assign({}, stage, {
+    running: stage.forceRunning || (stateInfo.isRunning && activeIndex === index),
+    stateLabel: stage.completed ? '已完成' : ((stage.forceRunning || (stateInfo.isRunning && activeIndex === index)) ? '进行中' : '待开始')
+  }));
+}
+
+function renderSessionBoard(snapshot, entries) {
+  const container = document.getElementById('sessionBoard');
+  const stateInfo = snapshot.agentState || {};
+  const session = ((snapshot.sessions || []).find(session => session.isActive)) || null;
+  const stages = buildSessionFlow(snapshot, entries);
+  const counts = buildTypeCounts(entries);
+  const durationMs = stateInfo.taskStartedAtMs && stateInfo.lastProgressAtMs
+    ? Math.max(0, stateInfo.lastProgressAtMs - stateInfo.taskStartedAtMs)
+    : 0;
+  const metaCards = [
+    { label: '当前会话', value: (session && (session.title || session.id)) || '当前设备全局流' },
+    { label: '轮次', value: (stateInfo.currentRound || 0) + '/' + (stateInfo.maxRounds || 0) },
+    { label: '步骤数', value: String((stateInfo.stepTimings || []).length) },
+    { label: '执行时长', value: durationMs > 0 ? formatDurationMs(durationMs) : '刚开始' },
+    { label: '活跃工具', value: stateInfo.activeTool || '暂无' },
+    { label: '动作数', value: String(counts.ACTION_EXECUTED || 0) }
+  ];
+  const recentEvents = (entries || []).slice().reverse().slice(0, 3);
+  container.innerHTML =
+    '<div class="session-topline">' +
+      '<div>' +
+        '<div class="session-title">' + escapeHtml((session && session.title) || '当前执行会话') + '</div>' +
+        '<div class="meta">' + escapeHtml(stateInfo.statusMessage || '等待新的任务') + '</div>' +
+      '</div>' +
+      '<div class="session-status' + (stateInfo.isRunning ? ' running' : '') + '">' + escapeHtml(stateInfo.isRunning ? '运行中' : '空闲') + '</div>' +
+    '</div>' +
+    '<div class="session-meta-grid">' +
+      metaCards.map(card => (
+        '<div class="session-meta-card">' +
+          '<div class="meta">' + escapeHtml(card.label) + '</div>' +
+          '<strong>' + escapeHtml(card.value) + '</strong>' +
+        '</div>'
+      )).join('') +
+    '</div>' +
+    '<div class="section-head" style="margin-top:0;"><h2 style="font-size:16px;">执行流程</h2><div class="meta">阶段会根据实时状态自动点亮。</div></div>' +
+    '<div class="flow-strip">' +
+      stages.map((stage, index) => (
+        '<article class="flow-stage ' + (stage.completed ? 'done' : (stage.running ? 'running' : 'pending')) + '">' +
+          '<div class="flow-index">' + (index + 1) + '</div>' +
+          '<h3>' + escapeHtml(stage.title) + '</h3>' +
+          '<div class="flow-caption">' + escapeHtml(stage.detail) + '</div>' +
+          '<div class="flow-tag">' + escapeHtml(stage.stateLabel) + '</div>' +
+        '</article>'
+      )).join('') +
+    '</div>' +
+    '<div class="session-event-grid">' +
+      (recentEvents.length ? recentEvents.map(entry => (
+        '<article class="session-event-card">' +
+          '<h3>' + escapeHtml(entry.title || formatType(entry.type)) + '</h3>' +
+          '<div class="meta">' + escapeHtml(entry.timestampFormatted || '') + '</div>' +
+          '<div class="flow-caption" style="margin-top:8px;">' + escapeHtml(summarizeText(entry.content, 96)) + '</div>' +
+        '</article>'
+      )).join('') : '<div class="timeline-empty">当前会话还没有更多事件。</div>') +
+    '</div>';
 }
 
 async function selectDevice(deviceId) {

@@ -50,6 +50,7 @@ internal class GestureCueOverlayView(context: Context) : View(context) {
     private var cueProgress = 0f
     private var fadeProgress = 0f
     private var animator: ValueAnimator? = null
+    private val overlayScreenLocation = IntArray(2)
 
     fun showTapCue(x: Float, y: Float, holdMs: Long, fadeMs: Long) {
         startCue(Cue.Tap(x, y), holdMs, fadeMs)
@@ -83,25 +84,49 @@ internal class GestureCueOverlayView(context: Context) : View(context) {
         val currentCue = cue ?: return
         val alphaScale = 1f - fadeProgress
         if (alphaScale <= 0f) return
+        val (offsetX, offsetY) = currentOverlayOffset()
 
         when (currentCue) {
-            is Cue.Tap -> drawTapCue(canvas, currentCue.x, currentCue.y, alphaScale)
+            is Cue.Tap -> drawTapCue(
+                canvas,
+                currentCue.x - offsetX,
+                currentCue.y - offsetY,
+                alphaScale
+            )
             is Cue.Swipe -> drawSwipeCue(
                 canvas = canvas,
-                points = listOf(
-                    currentCue.startX to currentCue.startY,
-                    currentCue.endX to currentCue.endY
+                points = translatePoints(
+                    listOf(
+                        currentCue.startX to currentCue.startY,
+                        currentCue.endX to currentCue.endY
+                    ),
+                    offsetX,
+                    offsetY
                 ),
                 alphaScale = alphaScale,
                 drawNumbers = false
             )
             is Cue.Sequence -> drawSwipeCue(
                 canvas = canvas,
-                points = currentCue.points,
+                points = translatePoints(currentCue.points, offsetX, offsetY),
                 alphaScale = alphaScale,
                 drawNumbers = true
             )
         }
+    }
+
+    private fun currentOverlayOffset(): Pair<Float, Float> {
+        if (!isAttachedToWindow) return 0f to 0f
+        getLocationOnScreen(overlayScreenLocation)
+        return overlayScreenLocation[0].toFloat() to overlayScreenLocation[1].toFloat()
+    }
+
+    private fun translatePoints(
+        points: List<Pair<Float, Float>>,
+        offsetX: Float,
+        offsetY: Float
+    ): List<Pair<Float, Float>> = points.map { (x, y) ->
+        (x - offsetX) to (y - offsetY)
     }
 
     private fun startCue(nextCue: Cue, holdMs: Long, fadeMs: Long) {

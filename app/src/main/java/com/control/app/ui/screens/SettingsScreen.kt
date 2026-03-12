@@ -67,10 +67,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
@@ -109,17 +111,32 @@ private fun PersistedTextField(
     trailingIcon: @Composable (() -> Unit)? = null,
     keyboardOptions: KeyboardOptions = KeyboardOptions.Default
 ) {
-    var localValue by remember(value) { mutableStateOf(value) }
+    var localValue by remember {
+        mutableStateOf(
+            TextFieldValue(
+                text = value,
+                selection = TextRange(value.length)
+            )
+        )
+    }
     var isEditing by remember { mutableStateOf(false) }
+    var pendingCommit by remember { mutableStateOf<String?>(null) }
 
-    if (!isEditing && localValue != value) {
-        localValue = value
+    if (pendingCommit == value) {
+        pendingCommit = null
+    } else if (!isEditing && pendingCommit == null && localValue.text != value) {
+        localValue = TextFieldValue(
+            text = value,
+            selection = TextRange(value.length)
+        )
     }
 
     fun commitIfChanged() {
         isEditing = false
-        if (localValue != value) {
-            onCommit(localValue)
+        val committedText = localValue.text
+        if (committedText != value) {
+            pendingCommit = committedText
+            onCommit(committedText)
         }
     }
 
@@ -127,6 +144,7 @@ private fun PersistedTextField(
         value = localValue,
         onValueChange = {
             isEditing = true
+            pendingCommit = null
             localValue = it
         },
         label = label,

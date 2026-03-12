@@ -50,32 +50,6 @@ object ToolDefinitions {
         ))
 
         add(buildTool(
-            name = "tap_element_sequence",
-            description = "按顺序连续点击多个编号元素。适用于计算器、拨号盘、PIN 键盘等稳定按键界面，可显著减少逐个点击的往返耗时。",
-            required = listOf("elements"),
-            properties = {
-                put("elements", buildJsonObject {
-                    put("type", "array")
-                    put("description", "要依次点击的元素编号列表，例如 [4, 5, 6, 12, 7, 8, 9]")
-                    put("items", buildJsonObject {
-                        put("type", "integer")
-                        put("description", "元素编号")
-                    })
-                    put("minItems", 1)
-                    put("maxItems", 12)
-                })
-                put("interval_ms", buildJsonObject {
-                    put("type", "integer")
-                    put("description", "相邻两次点击之间的间隔毫秒数，默认80，适合稳定按键界面")
-                })
-                put("description", buildJsonObject {
-                    put("type", "string")
-                    put("description", "操作说明")
-                })
-            }
-        ))
-
-        add(buildTool(
             name = "tap",
             description = "点击截图上的指定坐标。当目标不在元素列表中时使用。坐标基于截图像素。",
             required = listOf("x", "y"),
