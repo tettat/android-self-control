@@ -33,8 +33,8 @@ class AdbExecutor(private val context: Context) {
         private const val SCREENSHOT_TIMEOUT_MS = 20_000L
         private const val SCREENSHOT_MAX_ATTEMPTS = 3
         private const val SCREENSHOT_RETRY_DELAY_MS = 400L
-        private const val UI_DUMP_COMMAND_TIMEOUT_MS = 5_000L
-        private const val UI_DUMP_READ_TIMEOUT_MS = 2_000L
+        private const val UI_DUMP_COMMAND_TIMEOUT_MS = 7_000L
+        private const val UI_DUMP_READ_TIMEOUT_MS = 5_000L
     }
 
     private val connectionManager: AdbConnectionManagerImpl by lazy {
@@ -445,29 +445,40 @@ class AdbExecutor(private val context: Context) {
     suspend fun launchApp(packageName: String): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
             Log.d(TAG, "Launch app: $packageName")
-            val result = executeCommand(
+            val launchActivity = executeCommand(
+                "cmd package resolve-activity --brief $packageName | tail -n 1",
+                timeoutMs = 8_000L
+            ).getOrThrow().trim()
+
+            if (launchActivity.contains("/")) {
+                val startResult = executeCommand(
+                    "am start -n $launchActivity 2>&1",
+                    timeoutMs = 8_000L
+                ).getOrThrow()
+                if (!looksLikeShellFailure(startResult) && !startResult.contains("Error", ignoreCase = true)) {
+                    return@runCatching startResult
+                }
+            }
+
+            val monkeyResult = executeCommand(
                 "monkey -p $packageName -c android.intent.category.LAUNCHER 1 2>&1",
                 timeoutMs = 12_000L
             ).getOrThrow()
-
-            if (result.contains("No activities found") || result.contains("Error")) {
-                val launchActivity = executeCommand(
-                    "cmd package resolve-activity --brief $packageName | tail -n 1",
-                    timeoutMs = 8_000L
-                ).getOrThrow().trim()
-                if (launchActivity.contains("/")) {
-                    executeCommand("am start -n $launchActivity", timeoutMs = 8_000L).getOrThrow()
-                } else {
-                    throw RuntimeException("Cannot find launcher activity for $packageName")
-                }
-            } else {
-                result
+            if (monkeyResult.contains("No activities found") || looksLikeShellFailure(monkeyResult)) {
+                throw RuntimeException("Cannot launch $packageName: ${monkeyResult.trim()}")
             }
+            monkeyResult
         }
     }
 
     suspend fun dumpUiHierarchy(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
+            val directOutput = executeCommand(
+                "uiautomator dump /dev/tty",
+                timeoutMs = UI_DUMP_COMMAND_TIMEOUT_MS
+            ).getOrThrow()
+            extractUiHierarchyXml(directOutput)?.let { return@runCatching it }
+
             executeCommand(
                 "uiautomator dump /data/local/tmp/ui_dump.xml 2>&1",
                 timeoutMs = UI_DUMP_COMMAND_TIMEOUT_MS
@@ -477,8 +488,15 @@ class AdbExecutor(private val context: Context) {
                 timeoutMs = UI_DUMP_READ_TIMEOUT_MS
             ).getOrThrow()
             executeCommand("rm -f /data/local/tmp/ui_dump.xml")
-            xml
+            extractUiHierarchyXml(xml) ?: xml
         }
+    }
+
+    private fun extractUiHierarchyXml(output: String): String? {
+        val start = output.indexOf("<?xml")
+        val end = output.lastIndexOf("</hierarchy>")
+        if (start == -1 || end == -1 || end <= start) return null
+        return output.substring(start, end + "</hierarchy>".length)
     }
 
     suspend fun sendKeyEvent(keyCode: Int): Result<String> =

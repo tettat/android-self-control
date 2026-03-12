@@ -229,6 +229,16 @@ object ExecutionLogFormatter {
                 title = "调用模型生成下一步动作",
                 subtitle = label
             )
+            tool == "tap_element_sequence" -> StepTimingPresentation(
+                category = "批量输入",
+                title = "连续点击多个界面元素",
+                subtitle = tool
+            )
+            tool == "stable_keypad_fast_path" -> StepTimingPresentation(
+                category = "快速路径",
+                title = "直接执行稳定键盘序列",
+                subtitle = tool
+            )
             tool in setOf("tap", "tap_element", "tap_region") -> StepTimingPresentation(
                 category = "界面点击",
                 title = "点击界面元素",

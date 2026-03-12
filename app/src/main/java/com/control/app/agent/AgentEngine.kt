@@ -7,10 +7,13 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
+import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Display
 import android.widget.Toast
 import com.control.app.adb.AdbExecutor
 import com.control.app.ai.OpenAIClient
@@ -20,9 +23,12 @@ import com.control.app.log.ExecutionLogFormatter
 import com.control.app.prompt.DefaultPrompts
 import com.control.app.prompt.PromptManager
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -34,6 +40,7 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import java.io.ByteArrayOutputStream
@@ -61,6 +68,16 @@ class AgentEngine(
         private const val MODEL_IMAGE_DETAIL_ZOOM = "high"
         private const val MODEL_IMAGE_JPEG_QUALITY = 52
         private const val MODEL_ZOOM_IMAGE_JPEG_QUALITY = 64
+        private const val CALCULATOR_APP_FOREGROUND_TIMEOUT_MS = 2_000L
+        private const val CALCULATOR_APP_FOREGROUND_POLL_MS = 150L
+        private const val CALCULATOR_UI_STABILIZE_DELAY_MS = 800L
+        private const val CALCULATOR_FAST_PATH_TAP_DELAY_MS = 90L
+        private const val CALCULATOR_UI_RETRY_DELAY_MS = 250L
+        private const val CALCULATOR_UI_MAX_ATTEMPTS = 3
+        private const val TAP_SEQUENCE_DEFAULT_INTERVAL_MS = 80
+        private const val TAP_SEQUENCE_MAX_INTERVAL_MS = 250
+        private const val TAP_SEQUENCE_MAX_ELEMENTS = 12
+        private const val TAP_SEQUENCE_SETTLE_DELAY_MS = 150L
         private const val MAX_TOOL_CALLS_PER_STEP = 3
         private const val UI_DUMP_FAILURES_BEFORE_COOLDOWN = 2
         private const val UI_DUMP_COOLDOWN_CAPTURES = 5
@@ -70,6 +87,41 @@ class AgentEngine(
         private const val KEEP_RECENT_COUNT = 8
         /** Minimum number of middle messages to justify a compression call. */
         private const val MIN_MESSAGES_TO_COMPRESS = 5
+        private val STABLE_KEYPAD_APP_ALIASES = listOf(
+            StableKeypadTarget(
+                aliases = listOf("计算器", "calculator", "calc"),
+                foregroundPackages = listOf("com.miui.calculator", "com.android.calculator2")
+            ),
+            StableKeypadTarget(
+                aliases = listOf("电话", "拨号", "拨打", "通话", "phone", "dialer", "tel"),
+                foregroundPackages = listOf(
+                    "com.android.contacts",
+                    "com.qti.phone",
+                    "com.android.dialer",
+                    "com.android.phone"
+                ),
+                launchCommand = "am start -a android.intent.action.DIAL"
+            )
+        )
+        private val MIUI_CALCULATOR_KEYPAD = mapOf(
+            "C" to NormalizedPoint(0.1685f, 0.5417f),
+            "/" to NormalizedPoint(0.8306f, 0.5417f),
+            "7" to NormalizedPoint(0.1685f, 0.6333f),
+            "8" to NormalizedPoint(0.3889f, 0.6333f),
+            "9" to NormalizedPoint(0.6093f, 0.6333f),
+            "*" to NormalizedPoint(0.8306f, 0.6333f),
+            "4" to NormalizedPoint(0.1685f, 0.7252f),
+            "5" to NormalizedPoint(0.3889f, 0.7252f),
+            "6" to NormalizedPoint(0.6093f, 0.7252f),
+            "-" to NormalizedPoint(0.8306f, 0.7252f),
+            "1" to NormalizedPoint(0.1685f, 0.8173f),
+            "2" to NormalizedPoint(0.3889f, 0.8173f),
+            "3" to NormalizedPoint(0.6093f, 0.8173f),
+            "+" to NormalizedPoint(0.8306f, 0.8173f),
+            "0" to NormalizedPoint(0.3889f, 0.9094f),
+            "." to NormalizedPoint(0.6093f, 0.9094f),
+            "=" to NormalizedPoint(0.8306f, 0.9094f)
+        )
     }
 
     private val _debugLog = MutableStateFlow<List<DebugLogEntry>>(emptyList())
@@ -274,12 +326,18 @@ class AgentEngine(
         val messageHistory = session.messageHistory
         var resultMessage = "任务完成"
         var step = 0
-        var reflectionPhaseRequested = false
-        var reflectionPromptInjected = false
-        var reflectionSummary = ""
-        val savedSkillsInReflection = mutableListOf<String>()
+        var fastPathHandled = false
+        val stableKeypadPlan = parseStableKeypadPlan(voiceCommand)
 
         try {
+            if (stableKeypadPlan != null) {
+                tryExecuteStableKeypadBeforeCapture(stableKeypadPlan)?.let { fastPathResult ->
+                    resultMessage = fastPathResult
+                    fastPathHandled = true
+                }
+            }
+
+            if (!fastPathHandled) {
             // System message
             val systemPrompt = promptManager.getPrompt(DefaultPrompts.PROMPT_KEY_SYSTEM)
             messageHistory.add(buildJsonObject {
@@ -298,10 +356,20 @@ class AgentEngine(
             val initialCapture = captureScreen(settings.screenshotScale)
             setProgress(phaseTiming = initialCapture.timing)
 
-            val imageBase64 = initialCapture.imageBase64
-            val screenshotWidth = initialCapture.screenshotWidth
-            val screenshotHeight = initialCapture.screenshotHeight
-            val uiTree = initialCapture.uiTree
+            var effectiveCapture = initialCapture
+                if (stableKeypadPlan != null &&
+                    !hasStableKeypadCoverage(stableKeypadPlan, initialCapture.uiTreeResult)
+                ) {
+                retryStableKeypadCapture(stableKeypadPlan, settings.screenshotScale)?.let { retryCapture ->
+                    effectiveCapture = retryCapture
+                }
+            }
+
+            val imageBase64 = effectiveCapture.imageBase64
+            val screenshotWidth = effectiveCapture.screenshotWidth
+            val screenshotHeight = effectiveCapture.screenshotHeight
+            val uiTree = effectiveCapture.uiTree
+            val uiTreeResult = effectiveCapture.uiTreeResult
 
             val gridImage = drawZoneGrid(imageBase64)
             val initialCaptureTimingSummary = formatTimingBreakdown(initialCapture.timing)
@@ -321,6 +389,39 @@ class AgentEngine(
                     imageBase64 = gridImage
                 )
             )
+
+                if (stableKeypadPlan != null && uiTreeResult != null) {
+                    tryExecuteStableKeypadFromUi(
+                        plan = stableKeypadPlan,
+                        uiTreeResult = uiTreeResult,
+                        verificationMode = StableKeypadVerificationMode.NONE
+                    )?.let { fastPathResult ->
+                        resultMessage = fastPathResult
+                        fastPathHandled = true
+                    }
+            }
+
+            if (fastPathHandled) {
+                showTaskCompletionToast(resultMessage)
+                val currentState = _agentState.value
+                finalStepTimings = finalizeCurrentStep(currentState, System.currentTimeMillis())
+                _agentState.value = currentState.copy(
+                    isRunning = false,
+                    statusMessage = resultMessage,
+                    lastAction = resultMessage,
+                    stepTimings = finalStepTimings,
+                    currentPhaseTiming = TimingBreakdown()
+                )
+                sessionManager.endCurrentSession(resultMessage)
+                addLog(
+                    DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "任务结束",
+                        content = "结果: $resultMessage\n总步数: 0\n总耗时: ${formatDurationMs(System.currentTimeMillis() - startTime)}\n\n步骤耗时:\n${buildStepTimingSummary(finalStepTimings)}"
+                    )
+                )
+                return@coroutineScope resultMessage
+            }
 
             // Build initial user message with screenshot + task（注入已保存技巧名称供模型选择加载）
             val skillNames = skillStore?.getAllSkills()?.map { "${it.appName} (${it.packageName})" } ?: emptyList()
@@ -425,29 +526,8 @@ class AgentEngine(
                             activeTool = "",
                             lastAction = "AI 返回了最终文本响应"
                         )
-
-                        // In reflection phase: capture summary and ask model to call complete, then continue
-                        if (reflectionPhaseRequested && reflectionPromptInjected) {
-                            reflectionSummary = result.content
-                            messageHistory.add(
-                                buildTextOnlyUserMessage("若已反思完毕，请调用 complete 工具结束任务。")
-                            )
-                            setProgress(
-                                statusMessage = "反思中：已收到总结，请调用 complete 结束",
-                                lastAction = "等待模型调用 complete…",
-                                stepIntent = "等待模型调用 complete 结束"
-                            )
-                            addLog(
-                                DebugLogEntry(
-                                    type = DebugLogType.INFO,
-                                    title = "反思阶段",
-                                    content = "已收到反思总结，等待模型调用 complete 结束"
-                                )
-                            )
-                        } else {
-                            resultMessage = result.content.ifBlank { "任务完成" }
-                            break
-                        }
+                        resultMessage = result.content.ifBlank { "任务完成" }
+                        break
                     }
 
                     is AIChatResult.ToolCallResponse -> {
@@ -522,7 +602,7 @@ class AgentEngine(
 
                                 // Hide overlay before interactive actions
                                 val isInteractive = toolCall.functionName in listOf(
-                                    "tap", "tap_element", "input_element", "swipe",
+                                    "tap", "tap_element", "tap_element_sequence", "input_element", "swipe",
                                     "input_text", "scroll_down", "scroll_up", "adb_shell",
                                     "launch_app", "press_back", "press_home", "key_event",
                                     "tap_region"
@@ -542,10 +622,6 @@ class AgentEngine(
 
                                 // Add tool result to history
                                 messageHistory.add(buildToolResultMessage(toolCall.id, toolResult))
-
-                                if (toolCall.functionName == "save_skill" && reflectionPromptInjected) {
-                                    savedSkillsInReflection.add(toolResult)
-                                }
 
                                 addLog(
                                     DebugLogEntry(
@@ -568,14 +644,9 @@ class AgentEngine(
 
                                 // Check if this was the "complete" tool
                                 if (toolCall.functionName == "complete") {
-                                    if (reflectionPhaseRequested) {
-                                        taskCompleted = true
-                                        val msg = toolCall.arguments["message"]?.jsonPrimitive?.content
-                                        completionMessage = msg ?: "任务完成"
-                                    } else {
-                                        reflectionPhaseRequested = true
-                                        // Will inject reflection prompt after this for-loop
-                                    }
+                                    taskCompleted = true
+                                    val msg = toolCall.arguments["message"]?.jsonPrimitive?.content
+                                    completionMessage = msg ?: "任务完成"
                                 }
 
                                 // If zoom_region was called, capture the zoomed+grid image for override
@@ -587,7 +658,7 @@ class AgentEngine(
 
                                 // Wait for UI to settle after interactive actions
                                 if (isInteractive) {
-                                    delay(ACTION_SETTLE_DELAY_MS)
+                                    delay(settleDelayForTool(toolCall.functionName))
                                 }
                             } catch (e: CancellationException) {
                                 throw e
@@ -631,38 +702,9 @@ class AgentEngine(
 
                         if (taskCompleted) {
                             resultMessage = completionMessage
-                            if (reflectionSummary.isNotBlank() || savedSkillsInReflection.isNotEmpty()) {
-                                resultMessage += "\n\n【反思】\n"
-                                if (reflectionSummary.isNotBlank()) {
-                                    resultMessage += reflectionSummary.trim() + "\n"
-                                }
-                                if (savedSkillsInReflection.isNotEmpty()) {
-                                    resultMessage += "已保存技巧：\n" + savedSkillsInReflection.joinToString("\n")
-                                }
-                            }
                             break
                         }
 
-                        if (reflectionPhaseRequested && !reflectionPromptInjected) {
-                            messageHistory.add(
-                                buildTextOnlyUserMessage(
-                                    "请进行任务结束反思：\n1) 本次执行中做对的地方\n2) 做错或可改进的地方\n3) 若有可复用经验请调用 save_skill 保存。\n完成反思后再次调用 complete 工具表示真正结束。"
-                                )
-                            )
-                            reflectionPromptInjected = true
-                            addLog(
-                                DebugLogEntry(
-                                    type = DebugLogType.INFO,
-                                    title = "反思阶段",
-                                    content = "已插入反思提示，等待模型总结并可选保存技巧"
-                                )
-                            )
-                            setProgress(
-                                statusMessage = "反思中：总结做对/做错的地方，并可选保存技巧",
-                                lastAction = "等待反思结果…",
-                                stepIntent = "总结做对/做错的地方并可选保存技巧"
-                            )
-                        } else {
                         val shouldCaptureFreshScreen = shouldCaptureAfterToolCalls(
                             toolExecutionPlan.filter { it.shouldExecute }.map { it.toolCall }
                         )
@@ -744,13 +786,13 @@ class AgentEngine(
 
                         // Compress conversation history if it has grown too long
                         compressHistoryIfNeeded(messageHistory, settings)
-                        }
                     }
                 }
             }
 
             if (step >= settings.maxRounds && resultMessage == "任务完成") {
                 resultMessage = "已达到最大步数限制 (${settings.maxRounds})，任务可能未完成"
+            }
             }
 
         } catch (e: CancellationException) {
@@ -943,6 +985,869 @@ class AgentEngine(
         }
     }
 
+    private data class CalculatorUiSnapshot(
+        val expression: String,
+        val result: String,
+        val buttonCenters: Map<String, Pair<Int, Int>>
+    )
+
+    private data class NormalizedPoint(
+        val xFraction: Float,
+        val yFraction: Float
+    )
+
+    private suspend fun tryExecuteFastPath(voiceCommand: String): String? {
+        val plan = parseStableKeypadPlan(voiceCommand) ?: return null
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.INFO,
+                title = "快速路径命中",
+                content = "识别到稳定键盘任务，尝试本地批量输入: ${plan.sequence}"
+            )
+        )
+        _overlayVisible.value = false
+        delay(150)
+        return try {
+            runCatching { executeStableKeypadFastPath(plan) }
+                .onFailure { error ->
+                    addLog(
+                        DebugLogEntry(
+                            type = DebugLogType.INFO,
+                            title = "快速路径回退",
+                            content = "稳定键盘快速路径失败，回退到通用 AI 流程: ${error.message}"
+                        )
+                    )
+                }
+                .getOrNull()
+        } finally {
+            _overlayVisible.value = true
+        }
+    }
+
+    private suspend fun tryExecuteStableKeypadBeforeCapture(plan: StableKeypadPlan): String? {
+        _overlayVisible.value = false
+        delay(150)
+        return try {
+            runCatching { executeStableKeypadFastPath(plan) }
+                .onFailure { error ->
+                    addLog(
+                        DebugLogEntry(
+                            type = DebugLogType.INFO,
+                            title = "快速路径回退",
+                            content = "稳定键盘前置快路径失败，回退到标准截图链路: ${error.message}"
+                        )
+                    )
+                }
+                .getOrNull()
+        } finally {
+            _overlayVisible.value = true
+        }
+    }
+
+    private suspend fun maybeLaunchStableKeypadTarget(plan: StableKeypadPlan) {
+        if (plan.launchCommand == null && plan.foregroundPackages.isEmpty()) return
+
+        val launchStartedAt = System.currentTimeMillis()
+        setProgress(
+            statusMessage = "快速路径: 正在准备稳定键盘",
+            activeTool = "stable_keypad_fast_path",
+            lastAction = "根据任务预先打开目标应用",
+            toolArguments = buildStableKeypadToolArguments(plan),
+            stepIntent = "先把目标应用切到前台，再用轻量 UI 树判断是否能直接批量输入"
+        )
+
+        val requestedTarget = when {
+            plan.launchCommand != null -> {
+                adbExecutor.executeCommand(plan.launchCommand).getOrThrow()
+                plan.launchCommand
+            }
+            else -> {
+                plan.foregroundPackages.firstOrNull { pkg ->
+                    adbExecutor.launchApp(pkg).isSuccess
+                } ?: throw IllegalStateException("无法启动目标应用: ${plan.foregroundPackages.joinToString()}")
+            }
+        }
+
+        if (plan.foregroundPackages.isNotEmpty()) {
+            waitForForegroundPackage(
+                packages = plan.foregroundPackages.toSet(),
+                timeoutMs = CALCULATOR_APP_FOREGROUND_TIMEOUT_MS
+            ) ?: throw IllegalStateException(
+                "目标应用未进入前台，启动目标 $requestedTarget，当前前台 ${currentForegroundPackage().ifBlank { "unknown" }}"
+            )
+        }
+
+        setProgress(
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - launchStartedAt).coerceAtLeast(0L)
+            )
+        )
+        delay(CALCULATOR_UI_STABILIZE_DELAY_MS)
+    }
+
+    private suspend fun tryExecuteStableKeypadFromUi(
+        plan: StableKeypadPlan,
+        uiTreeResult: UiTreeResult,
+        verificationMode: StableKeypadVerificationMode
+    ): String? {
+        if (uiTreeResult.tokenElementMap.isEmpty()) return null
+        if (!plan.sequence.all { token -> uiTreeResult.tokenElementMap.containsKey(token.toString()) }) {
+            return null
+        }
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.INFO,
+                title = "快速路径命中",
+                content = "基于当前 UI 树识别到稳定键盘，尝试本地批量输入: ${plan.sequence}"
+            )
+        )
+
+        val sequenceAlreadyVisible = uiTreeResult.activeText.contains(plan.sequence) ||
+            uiTreeResult.visibleTexts.any { it.contains(plan.sequence) }
+        val canClearExistingInput = canClearStableKeypadInput(uiTreeResult)
+        if (sequenceAlreadyVisible && !canClearExistingInput) {
+            return "任务完成：当前界面已显示 ${plan.sequence}"
+        }
+
+        if (canClearExistingInput) {
+            maybeClearStableKeypadInput(uiTreeResult)
+        }
+
+        val tapStartedAt = System.currentTimeMillis()
+        plan.sequence.forEachIndexed { index, ch ->
+            val elementId = uiTreeResult.tokenElementMap[ch.toString()]
+                ?: throw IllegalStateException("当前 UI 树中缺少键位 '$ch'")
+            val (x, y) = uiTreeResult.elementMap[elementId]
+                ?: throw IllegalStateException("键位 '$ch' 缺少坐标")
+            adbExecutor.tap(x, y).getOrThrow()
+            if (index != plan.sequence.lastIndex) {
+                delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            }
+        }
+        delay(CALCULATOR_UI_RETRY_DELAY_MS)
+
+        setProgress(
+            statusMessage = "快速路径: 已输入表达式",
+            activeTool = "stable_keypad_fast_path",
+            lastAction = "已基于当前 UI 树本地输入 ${plan.sequence}",
+            toolArguments = buildStableKeypadToolArguments(plan, uiTreeResult.packageName),
+            stepIntent = "在稳定键盘界面直接批量点击整串按键，避免进入模型回合",
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - tapStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        val verifiedTree = when (verificationMode) {
+            StableKeypadVerificationMode.UI_DUMP -> dumpStableKeypadUiTreeWithRetry()
+            StableKeypadVerificationMode.NONE -> null
+        }
+        val verified = verifiedTree != null &&
+            (verifiedTree.activeText.contains(plan.sequence) ||
+                verifiedTree.visibleTexts.any { it.contains(plan.sequence) })
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.ACTION_EXECUTED,
+                title = "执行: stable_keypad_fast_path",
+                content = buildString {
+                    appendLine("package=${verifiedTree?.packageName ?: uiTreeResult.packageName}")
+                    appendLine("sequence=${plan.sequence}")
+                    append("verified=${if (verified) "true" else "best-effort"}")
+                }
+            )
+        )
+
+        return if (verified) {
+            "任务完成：已通过稳定键盘快速输入 ${plan.sequence}"
+        } else {
+            "任务完成：已触发稳定键盘快速输入 ${plan.sequence}"
+        }
+    }
+
+    private fun hasStableKeypadCoverage(
+        plan: StableKeypadPlan,
+        uiTreeResult: UiTreeResult?
+    ): Boolean {
+        if (uiTreeResult == null) return false
+        return plan.sequence.all { token -> uiTreeResult.tokenElementMap.containsKey(token.toString()) }
+    }
+
+    private suspend fun dumpStableKeypadUiTreeWithRetry(
+        plan: StableKeypadPlan? = null
+    ): UiTreeResult? {
+        var lastTree: UiTreeResult? = null
+        repeat(CALCULATOR_UI_MAX_ATTEMPTS) { attempt ->
+            val tree = runCatching {
+                val rawXml = adbExecutor.dumpUiHierarchy().getOrThrow()
+                withContext(Dispatchers.Default) { simplifyUiTree(rawXml) }
+            }.getOrNull()
+            if (tree != null) {
+                lastTree = tree
+                if (plan == null || hasStableKeypadCoverage(plan, tree)) {
+                    return tree
+                }
+            }
+            if (attempt != CALCULATOR_UI_MAX_ATTEMPTS - 1) {
+                delay(CALCULATOR_UI_RETRY_DELAY_MS)
+            }
+        }
+        return lastTree
+    }
+
+    private suspend fun retryStableKeypadCapture(
+        plan: StableKeypadPlan,
+        screenshotScale: Float
+    ): ScreenCapture? {
+        repeat(2) { attempt ->
+            delay(350L)
+            val retryCapture = runCatching { captureScreen(screenshotScale) }.getOrNull() ?: return@repeat
+            if (hasStableKeypadCoverage(plan, retryCapture.uiTreeResult)) {
+                addLog(
+                    DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "快速路径重试",
+                        content = "第 ${attempt + 1} 次补充抓屏后识别到完整稳定键盘，继续尝试本地批量输入"
+                    )
+                )
+                return retryCapture
+            }
+        }
+        return null
+    }
+
+    private data class StableKeypadPlan(
+        val foregroundPackages: List<String>,
+        val sequence: String,
+        val launchCommand: String? = null
+    )
+
+    private data class StableKeypadTarget(
+        val aliases: List<String>,
+        val foregroundPackages: List<String>,
+        val launchCommand: String? = null
+    )
+
+    private enum class StableKeypadVerificationMode {
+        UI_DUMP,
+        NONE
+    }
+
+    private data class StableKeypadSnapshot(
+        val packageName: String,
+        val activeText: String,
+        val visibleTexts: List<String>,
+        val tokenCenters: Map<String, Pair<Int, Int>>
+    )
+
+    private fun parseStableKeypadPlan(command: String): StableKeypadPlan? {
+        val lower = command.lowercase(Locale.ROOT)
+        val explicitSequence = Regex("""(?:输入|键入|拨打|拨号|input|dial)\s*([0-9+\-*/xX×÷.=#]+)""")
+            .find(command)
+            ?.groupValues
+            ?.getOrNull(1)
+        val fallbackSequence = Regex("""[0-9+\-*/xX×÷.=#]{3,}""")
+            .findAll(command)
+            .map { it.value }
+            .firstOrNull()
+        val normalizedSequence = (explicitSequence ?: fallbackSequence)
+            ?.replace(" ", "")
+            ?.replace("×", "*")
+            ?.replace("x", "*")
+            ?.replace("X", "*")
+            ?.replace("÷", "/")
+            ?: return null
+        if (!normalizedSequence.all { it.isDigit() || it in setOf('+', '-', '*', '/', '.', '#', '=') }) {
+            return null
+        }
+
+        val matchedTarget = STABLE_KEYPAD_APP_ALIASES.firstOrNull { target ->
+            target.aliases.any { alias -> command.contains(alias) || lower.contains(alias) }
+        }
+
+        val inferredTarget = matchedTarget ?: if (normalizedSequence.any { it in setOf('+', '-', '*', '/', '.', '=') }) {
+            StableKeypadTarget(
+                aliases = emptyList(),
+                foregroundPackages = listOf("com.miui.calculator", "com.android.calculator2")
+            )
+        } else {
+            null
+        }
+
+        return StableKeypadPlan(
+            foregroundPackages = inferredTarget?.foregroundPackages.orEmpty().distinct(),
+            sequence = normalizedSequence,
+            launchCommand = inferredTarget?.launchCommand
+        )
+    }
+
+    private suspend fun executeStableKeypadFastPath(plan: StableKeypadPlan): String {
+        maybeLaunchStableKeypadTarget(plan)
+
+        val initialSnapshot = dumpStableKeypadSnapshotWithRetry()
+        if (!plan.sequence.all { token -> initialSnapshot.tokenCenters.containsKey(token.toString()) }) {
+            throw IllegalStateException("当前界面未提供完整键位，无法本地批量输入 ${plan.sequence}")
+        }
+
+        maybeClearStableKeypadInput(initialSnapshot)
+
+        val tapStartedAt = System.currentTimeMillis()
+        plan.sequence.forEachIndexed { index, ch ->
+            val coords = initialSnapshot.tokenCenters[ch.toString()]
+                ?: throw IllegalStateException("找不到键位 '$ch'")
+            adbExecutor.tap(coords.first, coords.second).getOrThrow()
+            if (index != plan.sequence.lastIndex) {
+                delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            }
+        }
+        setProgress(
+            statusMessage = "快速路径: 已输入表达式",
+            activeTool = "stable_keypad_fast_path",
+            lastAction = "已本地输入 ${plan.sequence}",
+            toolArguments = buildStableKeypadToolArguments(plan, initialSnapshot.packageName),
+            stepIntent = "基于当前 UI 树识别出的稳定键盘，批量点击完整序列",
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - tapStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        delay(200)
+        val verifiedSnapshot = runCatching { dumpStableKeypadSnapshotWithRetry() }.getOrNull()
+        if (verifiedSnapshot != null &&
+            verifiedSnapshot.activeText.isNotBlank() &&
+            !verifiedSnapshot.activeText.contains(plan.sequence) &&
+            verifiedSnapshot.visibleTexts.none { it.contains(plan.sequence) }
+        ) {
+            throw IllegalStateException("本地批量输入后未在界面上看到目标序列 ${plan.sequence}")
+        }
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.ACTION_EXECUTED,
+                title = "执行: stable_keypad_fast_path",
+                content = buildString {
+                    appendLine("package=${verifiedSnapshot?.packageName ?: initialSnapshot.packageName}")
+                    appendLine("sequence=${plan.sequence}")
+                    append("activeText=${verifiedSnapshot?.activeText?.ifBlank { "(unverified)" } ?: "(unverified)"}")
+                }
+            )
+        )
+
+        return "任务完成：已通过稳定键盘快速输入 ${plan.sequence}"
+    }
+
+    private suspend fun maybeClearStableKeypadInput(snapshot: StableKeypadSnapshot) {
+        val currentValue = snapshot.activeText.trim()
+        if (currentValue.isBlank() || currentValue == "0") return
+
+        snapshot.tokenCenters["CLEAR"]?.let { (x, y) ->
+            adbExecutor.tap(x, y).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            return
+        }
+
+        val backspace = snapshot.tokenCenters["BACKSPACE"] ?: return
+        repeat(currentValue.length.coerceAtMost(20)) {
+            adbExecutor.tap(backspace.first, backspace.second).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+        }
+    }
+
+    private fun canClearStableKeypadInput(uiTreeResult: UiTreeResult): Boolean {
+        return uiTreeResult.tokenElementMap.containsKey("CLEAR") ||
+            uiTreeResult.tokenElementMap.containsKey("BACKSPACE")
+    }
+
+    private fun buildStableKeypadToolArguments(
+        plan: StableKeypadPlan,
+        activePackage: String? = null
+    ): String {
+        return buildString {
+            append("sequence=${plan.sequence}")
+            if (plan.foregroundPackages.isNotEmpty()) {
+                append(", packages=${plan.foregroundPackages.joinToString()}")
+            }
+            if (!plan.launchCommand.isNullOrBlank()) {
+                append(", launch=${plan.launchCommand}")
+            }
+            if (!activePackage.isNullOrBlank()) {
+                append(", package=$activePackage")
+            }
+        }
+    }
+
+    private suspend fun maybeClearStableKeypadInput(uiTreeResult: UiTreeResult) {
+        val currentValue = uiTreeResult.activeText.trim()
+        if (currentValue.isBlank() || currentValue == "0") return
+
+        uiTreeResult.tokenElementMap["CLEAR"]?.let { elementId ->
+            val (x, y) = uiTreeResult.elementMap[elementId] ?: return
+            adbExecutor.tap(x, y).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            return
+        }
+
+        val backspaceId = uiTreeResult.tokenElementMap["BACKSPACE"] ?: return
+        val (x, y) = uiTreeResult.elementMap[backspaceId] ?: return
+        repeat(currentValue.length.coerceAtMost(20)) {
+            adbExecutor.tap(x, y).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+        }
+    }
+
+    private suspend fun dumpStableKeypadSnapshotWithRetry(): StableKeypadSnapshot {
+        var lastError: Throwable? = null
+        repeat(CALCULATOR_UI_MAX_ATTEMPTS) { attempt ->
+            try {
+                val rawXml = adbExecutor.dumpUiHierarchy().getOrThrow()
+                return parseStableKeypadSnapshot(rawXml)
+                    ?: throw IllegalStateException("无法识别当前稳定键盘")
+            } catch (error: Throwable) {
+                lastError = error
+                if (attempt != CALCULATOR_UI_MAX_ATTEMPTS - 1) {
+                    delay(CALCULATOR_UI_RETRY_DELAY_MS)
+                }
+            }
+        }
+        throw IllegalStateException(
+            "稳定键盘快速路径抓取界面失败，已重试 $CALCULATOR_UI_MAX_ATTEMPTS 次",
+            lastError
+        )
+    }
+
+    private fun parseStableKeypadSnapshot(xml: String): StableKeypadSnapshot? {
+        val boundsRegex = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+        val nodeRegex = Regex("""<node\s+([^>]+?)/?>\s*""")
+        val attrRegex = Regex("""(\w[\w-]*)="([^"]*?)"""")
+
+        var packageName = ""
+        var activeText = ""
+        val visibleTexts = linkedSetOf<String>()
+        val tokenCenters = linkedMapOf<String, Pair<Int, Int>>()
+
+        for (nodeMatch in nodeRegex.findAll(xml)) {
+            val attrs = mutableMapOf<String, String>()
+            for (attrMatch in attrRegex.findAll(nodeMatch.groupValues[1])) {
+                attrs[attrMatch.groupValues[1]] = attrMatch.groupValues[2]
+            }
+
+            if (packageName.isBlank()) {
+                packageName = attrs["package"].orEmpty()
+            }
+
+            val resourceId = (attrs["resource-id"] ?: "").substringAfterLast("/")
+            val text = attrs["text"].orEmpty()
+            val contentDesc = attrs["content-desc"].orEmpty()
+            val className = attrs["class"].orEmpty()
+            val clickable = attrs["clickable"] == "true"
+            val focusable = attrs["focusable"] == "true"
+            val focused = attrs["focused"] == "true"
+            val enabled = attrs["enabled"] != "false"
+
+            if (text.isNotBlank()) visibleTexts += text
+            if (contentDesc.isNotBlank()) visibleTexts += contentDesc
+            if ((focused || className.contains("EditText")) && text.isNotBlank()) {
+                activeText = text
+            }
+
+            val bounds = attrs["bounds"] ?: continue
+            val boundsMatch = boundsRegex.find(bounds) ?: continue
+            val center = Pair(
+                (boundsMatch.groupValues[1].toInt() + boundsMatch.groupValues[3].toInt()) / 2,
+                (boundsMatch.groupValues[2].toInt() + boundsMatch.groupValues[4].toInt()) / 2
+            )
+
+            val token = deriveStableKeypadToken(resourceId, text, contentDesc) ?: continue
+            if (!enabled) continue
+            if (!clickable && !focusable && token !in setOf(
+                    "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+                    "+", "-", "*", "/", ".", "#", "=", "CLEAR", "BACKSPACE"
+                )
+            ) {
+                continue
+            }
+            tokenCenters[token] = center
+        }
+
+        if (tokenCenters.isEmpty()) return null
+        return StableKeypadSnapshot(
+            packageName = packageName,
+            activeText = activeText,
+            visibleTexts = visibleTexts.toList(),
+            tokenCenters = tokenCenters
+        )
+    }
+
+    private fun deriveStableKeypadToken(
+        resourceId: String,
+        text: String,
+        contentDesc: String
+    ): String? {
+        val raw = text.ifBlank { contentDesc }
+        return when {
+            resourceId.startsWith("digit_") -> resourceId.removePrefix("digit_")
+            resourceId == "one" || raw.startsWith("一") -> "1"
+            resourceId == "two" || raw.startsWith("二") -> "2"
+            resourceId == "three" || raw.startsWith("三") -> "3"
+            resourceId == "four" || raw.startsWith("四") -> "4"
+            resourceId == "five" || raw.startsWith("五") -> "5"
+            resourceId == "six" || raw.startsWith("六") -> "6"
+            resourceId == "seven" || raw.startsWith("七") -> "7"
+            resourceId == "eight" || raw.startsWith("八") -> "8"
+            resourceId == "nine" || raw.startsWith("九") -> "9"
+            resourceId == "zero" || raw.startsWith("零") -> "0"
+            resourceId == "star" -> "*"
+            resourceId == "pound" -> "#"
+            resourceId == "op_add" || contentDesc == "加" -> "+"
+            resourceId == "op_sub" || contentDesc == "减" -> "-"
+            resourceId == "op_mul" || contentDesc == "乘" -> "*"
+            resourceId == "op_div" || contentDesc == "除" -> "/"
+            resourceId == "dec_point" || contentDesc == "小数点" || raw == "." -> "."
+            resourceId.contains("equal") || contentDesc == "等于" || raw == "=" -> "="
+            resourceId == "btn_c_s" || contentDesc == "清除" || raw == "清除" -> "CLEAR"
+            resourceId.contains("del") || resourceId.contains("delete") ||
+                contentDesc.contains("退格") || contentDesc.contains("删除") -> "BACKSPACE"
+            raw.length == 1 && raw[0].isDigit() -> raw
+            raw in setOf("+", "-", "*", "/", ".", "#", "=") -> raw
+            else -> null
+        }
+    }
+
+    private fun parseCalculatorExpressionCommand(command: String): String? {
+        if (!command.contains("计算器")) return null
+
+        val expressionCandidate = Regex("""[0-9+\-*/xX×÷.= ]+""")
+            .findAll(command)
+            .map { it.value.trim() }
+            .firstOrNull { candidate ->
+                candidate.length >= 3 && candidate.any { it.isDigit() }
+            } ?: return null
+
+        val normalized = expressionCandidate
+            .replace(" ", "")
+            .replace("×", "*")
+            .replace("x", "*")
+            .replace("X", "*")
+            .replace("÷", "/")
+        if (normalized.isBlank()) return null
+        if (!normalized.all { it.isDigit() || it in setOf('+', '-', '*', '/', '.', '=') }) {
+            return null
+        }
+        return normalized
+    }
+
+    private suspend fun executeCalculatorFastPath(expression: String): String {
+        val launchPackages = listOf("com.miui.calculator", "com.android.calculator2")
+        val launchStartedAt = System.currentTimeMillis()
+        setProgress(
+            statusMessage = "快速路径: 正在启动计算器",
+            activeTool = "calculator_fast_path",
+            lastAction = "识别到计算器表达式任务，尝试直连快速执行",
+            toolArguments = "expression=$expression",
+            stepIntent = "直接启动计算器并输入表达式"
+        )
+
+        val requestedPackage = launchPackages.firstOrNull { pkg ->
+            adbExecutor.launchApp(pkg).isSuccess
+        } ?: throw IllegalStateException("无法启动可用的计算器应用")
+        setProgress(
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - launchStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        val launchedPackage = waitForForegroundPackage(
+            packages = launchPackages.toSet(),
+            timeoutMs = CALCULATOR_APP_FOREGROUND_TIMEOUT_MS
+        ) ?: throw IllegalStateException(
+            "计算器未进入前台，启动目标 $requestedPackage，当前前台 ${currentForegroundPackage().ifBlank { "unknown" }}"
+        )
+        delay(CALCULATOR_UI_STABILIZE_DELAY_MS)
+
+        if (launchedPackage == "com.miui.calculator") {
+            return executeMiuiCalculatorFastPath(expression, launchedPackage)
+        }
+
+        val initialSnapshot = dumpCalculatorUiSnapshotWithRetry()
+        if (initialSnapshot.expression == expression || initialSnapshot.result.contains(expression)) {
+            addLog(
+                DebugLogEntry(
+                    type = DebugLogType.INFO,
+                    title = "快速路径命中",
+                    content = "计算器已显示目标表达式，无需重复输入: $expression"
+                )
+            )
+            return "任务完成：计算器已显示 $expression"
+        }
+
+        if (initialSnapshot.expression.isNotBlank() && initialSnapshot.expression != "0") {
+            val clearButton = initialSnapshot.buttonCenters["C"]
+                ?: throw IllegalStateException("找不到计算器清除按钮")
+            val clearStartedAt = System.currentTimeMillis()
+            adbExecutor.tap(clearButton.first, clearButton.second).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            setProgress(
+                statusMessage = "快速路径: 清空旧算式",
+                activeTool = "calculator_fast_path",
+                lastAction = "已点击清除按钮",
+                toolArguments = "expression=$expression",
+                stepIntent = "先清空旧算式，避免错误追加",
+                phaseTiming = TimingBreakdown(
+                    toolMs = (System.currentTimeMillis() - clearStartedAt).coerceAtLeast(0L)
+                )
+            )
+        }
+
+        val refreshedSnapshot = dumpCalculatorUiSnapshotWithRetry()
+        val tapStartedAt = System.currentTimeMillis()
+        expression.forEachIndexed { index, ch ->
+            val token = calculatorTokenForChar(ch)
+            val coords = refreshedSnapshot.buttonCenters[token]
+                ?: throw IllegalStateException("找不到计算器按键 '$ch' 对应的控件")
+            adbExecutor.tap(coords.first, coords.second).getOrThrow()
+            if (index != expression.lastIndex) {
+                delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            }
+        }
+        setProgress(
+            statusMessage = "快速路径: 已输入表达式",
+            activeTool = "calculator_fast_path",
+            lastAction = "已直接输入 $expression",
+            toolArguments = "expression=$expression, package=$launchedPackage",
+            stepIntent = "批量输入计算器表达式",
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - tapStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        delay(250)
+        val finalSnapshot = dumpCalculatorUiSnapshotWithRetry()
+        if (finalSnapshot.expression != expression && !finalSnapshot.result.contains(expression)) {
+            throw IllegalStateException(
+                "表达式校验失败，当前显示 '${finalSnapshot.expression}'，结果 '${finalSnapshot.result}'"
+            )
+        }
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.ACTION_EXECUTED,
+                title = "执行: calculator_fast_path",
+                content = "package=$launchedPackage\nexpression=$expression\nresult=${finalSnapshot.result.ifBlank { "(empty)" }}"
+            )
+        )
+
+        return if (finalSnapshot.result.isNotBlank()) {
+            "任务完成：计算器已输入 $expression，当前结果 ${finalSnapshot.result}"
+        } else {
+            "任务完成：计算器已输入 $expression"
+        }
+    }
+
+    private suspend fun executeMiuiCalculatorFastPath(
+        expression: String,
+        packageName: String
+    ): String {
+        val (screenWidth, screenHeight) = getPhysicalDisplaySize()
+
+        // MIUI calculator keypad is stable on this device family. Clear once, then tap the
+        // expression directly using normalized keypad coordinates to avoid repeated UI dumps.
+        miuiCalculatorPointForToken("C", screenWidth, screenHeight)?.let { (x, y) ->
+            adbExecutor.tap(x, y).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+        }
+
+        val tapStartedAt = System.currentTimeMillis()
+        expression.forEachIndexed { index, ch ->
+            val token = calculatorTokenForChar(ch)
+            val coords = miuiCalculatorPointForToken(token, screenWidth, screenHeight)
+                ?: throw IllegalStateException("找不到 MIUI 计算器按键 '$ch' 的坐标")
+            adbExecutor.tap(coords.first, coords.second).getOrThrow()
+            if (index != expression.lastIndex) {
+                delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            }
+        }
+        setProgress(
+            statusMessage = "快速路径: 已输入表达式",
+            activeTool = "calculator_fast_path",
+            lastAction = "已直接输入 $expression",
+            toolArguments = "expression=$expression, package=$packageName",
+            stepIntent = "按稳定键位批量输入计算器表达式",
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - tapStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        delay(200)
+        val verifiedSnapshot = runCatching { dumpCalculatorUiSnapshotWithRetry() }.getOrNull()
+        if (verifiedSnapshot != null &&
+            verifiedSnapshot.expression.isNotBlank() &&
+            verifiedSnapshot.expression != expression
+        ) {
+            throw IllegalStateException(
+                "MIUI 计算器表达式校验失败，当前显示 '${verifiedSnapshot.expression}'"
+            )
+        }
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.ACTION_EXECUTED,
+                title = "执行: calculator_fast_path",
+                content = buildString {
+                    appendLine("package=$packageName")
+                    appendLine("expression=$expression")
+                    append("result=${verifiedSnapshot?.result?.ifBlank { "(unverified)" } ?: "(unverified)"}")
+                }
+            )
+        )
+
+        return if (!verifiedSnapshot?.result.isNullOrBlank()) {
+            "任务完成：计算器已输入 $expression，当前结果 ${verifiedSnapshot?.result}"
+        } else {
+            "任务完成：计算器已输入 $expression"
+        }
+    }
+
+    private suspend fun dumpCalculatorUiSnapshot(): CalculatorUiSnapshot {
+        val rawXml = adbExecutor.dumpUiHierarchy().getOrThrow()
+        return parseCalculatorUiSnapshot(rawXml)
+            ?: throw IllegalStateException("无法解析计算器界面")
+    }
+
+    private suspend fun dumpCalculatorUiSnapshotWithRetry(): CalculatorUiSnapshot {
+        var lastError: Throwable? = null
+        repeat(CALCULATOR_UI_MAX_ATTEMPTS) { attempt ->
+            try {
+                return dumpCalculatorUiSnapshot()
+            } catch (error: Throwable) {
+                lastError = error
+                if (attempt != CALCULATOR_UI_MAX_ATTEMPTS - 1) {
+                    delay(CALCULATOR_UI_RETRY_DELAY_MS)
+                }
+            }
+        }
+        throw IllegalStateException(
+            "计算器快速路径抓取界面失败，已重试 $CALCULATOR_UI_MAX_ATTEMPTS 次",
+            lastError
+        )
+    }
+
+    private suspend fun currentForegroundPackage(): String {
+        val output = adbExecutor.executeCommand(
+            "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'"
+        ).getOrThrow()
+        val pkgRegex = Regex("""(\w+(?:\.\w+)+)/""")
+        return pkgRegex.find(output)?.groupValues?.get(1).orEmpty()
+    }
+
+    private suspend fun waitForForegroundPackage(
+        packages: Set<String>,
+        timeoutMs: Long
+    ): String? {
+        val startedAt = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startedAt <= timeoutMs) {
+            val foreground = runCatching { currentForegroundPackage() }.getOrDefault("")
+            if (foreground in packages) {
+                return foreground
+            }
+            delay(CALCULATOR_APP_FOREGROUND_POLL_MS)
+        }
+        return null
+    }
+
+    private fun miuiCalculatorPointForToken(
+        token: String,
+        screenWidth: Int,
+        screenHeight: Int
+    ): Pair<Int, Int>? {
+        val point = MIUI_CALCULATOR_KEYPAD[token] ?: return null
+        return Pair(
+            (screenWidth * point.xFraction).toInt(),
+            (screenHeight * point.yFraction).toInt()
+        )
+    }
+
+    private fun getPhysicalDisplaySize(): Pair<Int, Int> {
+        val displayManager = appContext.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        if (display != null) {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(metrics)
+            if (metrics.widthPixels > 0 && metrics.heightPixels > 0) {
+                return Pair(metrics.widthPixels, metrics.heightPixels)
+            }
+            val mode = display.mode
+            if (mode != null && mode.physicalWidth > 0 && mode.physicalHeight > 0) {
+                return Pair(mode.physicalWidth, mode.physicalHeight)
+            }
+        }
+        val fallback = appContext.resources.displayMetrics
+        return Pair(fallback.widthPixels, fallback.heightPixels)
+    }
+
+    private fun parseCalculatorUiSnapshot(xml: String): CalculatorUiSnapshot? {
+        val boundsRegex = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+        val nodeRegex = Regex("""<node\s+([^>]+?)/?>\s*""")
+        val attrRegex = Regex("""(\w[\w-]*)="([^"]*?)"""")
+
+        var expression = ""
+        var result = ""
+        val buttonCenters = mutableMapOf<String, Pair<Int, Int>>()
+
+        for (nodeMatch in nodeRegex.findAll(xml)) {
+            val attrs = mutableMapOf<String, String>()
+            for (attrMatch in attrRegex.findAll(nodeMatch.groupValues[1])) {
+                attrs[attrMatch.groupValues[1]] = attrMatch.groupValues[2]
+            }
+
+            val resourceId = (attrs["resource-id"] ?: "").substringAfterLast("/")
+            val text = attrs["text"] ?: ""
+            val contentDesc = attrs["content-desc"] ?: ""
+            val bounds = attrs["bounds"] ?: ""
+            val boundsMatch = boundsRegex.find(bounds) ?: continue
+            val left = boundsMatch.groupValues[1].toInt()
+            val top = boundsMatch.groupValues[2].toInt()
+            val right = boundsMatch.groupValues[3].toInt()
+            val bottom = boundsMatch.groupValues[4].toInt()
+            val center = Pair((left + right) / 2, (top + bottom) / 2)
+
+            when (resourceId) {
+                "expression" -> expression = text
+                "result" -> result = text
+            }
+
+            val token = when {
+                resourceId == "btn_c_s" || contentDesc == "清除" -> "C"
+                resourceId == "op_add" || contentDesc == "加" -> "+"
+                resourceId == "op_sub" || contentDesc == "减" -> "-"
+                resourceId == "op_mul" || contentDesc == "乘" -> "*"
+                resourceId == "op_div" || contentDesc == "除" -> "/"
+                resourceId == "dec_point" || text == "." || contentDesc == "小数点" -> "."
+                resourceId == "btn_equal_s" || contentDesc == "等于" -> "="
+                resourceId.startsWith("digit_") -> resourceId.removePrefix("digit_")
+                text.length == 1 && text[0].isDigit() -> text
+                else -> null
+            }
+
+            if (token != null) {
+                buttonCenters[token] = center
+            }
+        }
+
+        if (buttonCenters.isEmpty()) return null
+        return CalculatorUiSnapshot(
+            expression = expression,
+            result = result,
+            buttonCenters = buttonCenters
+        )
+    }
+
+    private fun calculatorTokenForChar(ch: Char): String = when (ch) {
+        in '0'..'9' -> ch.toString()
+        '+', '-', '*', '/', '.', '=' -> ch.toString()
+        else -> throw IllegalArgumentException("不支持的计算器字符: $ch")
+    }
+
     /**
      * Capture screenshot and UI tree. Returns a data class with all needed info.
      * Handles overlay hiding/showing and coordinate scaling.
@@ -952,6 +1857,7 @@ class AgentEngine(
         val screenshotWidth: Int,
         val screenshotHeight: Int,
         val uiTree: String?,
+        val uiTreeResult: UiTreeResult?,
         val timing: TimingBreakdown
     )
 
@@ -960,43 +1866,65 @@ class AgentEngine(
         _overlayVisible.value = false
         delay(150)
 
-        // Take screenshot
-        val screenshotStartedAt = System.currentTimeMillis()
-        val screenshotResult = adbExecutor.takeScreenshot(screenshotScale)
-        val screenshotMs = (System.currentTimeMillis() - screenshotStartedAt).coerceAtLeast(0L)
-
-        // Dump UI hierarchy while overlay is still hidden
+        // Run screenshot and UI dump in parallel to reduce total capture time
         currentElementMap = emptyMap()
-        val uiDumpStartedAt = System.currentTimeMillis()
-        val uiTreeResult = if (uiDumpCooldownRemaining > 0) {
-            uiDumpCooldownRemaining--
-            Log.d(TAG, "Skipping UI dump due to cooldown, remaining=$uiDumpCooldownRemaining")
-            null
-        } else {
-            try {
-                adbExecutor.dumpUiHierarchy().fold(
-                    onSuccess = { rawXml ->
-                        if (rawXml.isBlank()) {
-                            registerUiDumpFailure("uiautomator dump returned empty XML")
-                            null
-                        } else {
-                            uiDumpFailureStreak = 0
-                            simplifyUiTree(rawXml)
-                        }
-                    },
-                    onFailure = { error ->
-                        registerUiDumpFailure(error.message ?: "unknown error")
-                        Log.w(TAG, "UI tree dump failed: ${error.message}")
+
+        data class ParallelCaptureResult(
+            val screenshotResult: Result<Bitmap>,
+            val uiTreeResult: UiTreeResult?,
+            val screenshotMs: Long,
+            val uiDumpMs: Long
+        )
+        data class ScreenshotTimed(val result: Result<Bitmap>, val ms: Long)
+        data class UiDumpTimed(val tree: UiTreeResult?, val ms: Long)
+
+        val parallelResult = coroutineScope {
+            val screenshotDeferred = async {
+                val t0 = System.currentTimeMillis()
+                val r = adbExecutor.takeScreenshot(screenshotScale)
+                ScreenshotTimed(r, (System.currentTimeMillis() - t0).coerceAtLeast(0L))
+            }
+            val uiDumpDeferred = async {
+                val t0 = System.currentTimeMillis()
+                val tree = if (uiDumpCooldownRemaining > 0) {
+                    uiDumpCooldownRemaining--
+                    Log.d(TAG, "Skipping UI dump due to cooldown, remaining=$uiDumpCooldownRemaining")
+                    null
+                } else {
+                    try {
+                        adbExecutor.dumpUiHierarchy().fold(
+                            onSuccess = { rawXml ->
+                                if (rawXml.isBlank()) {
+                                    registerUiDumpFailure("uiautomator dump returned empty XML")
+                                    null
+                                } else {
+                                    uiDumpFailureStreak = 0
+                                    withContext(Dispatchers.Default) { simplifyUiTree(rawXml) }
+                                }
+                            },
+                            onFailure = { error ->
+                                registerUiDumpFailure(error.message ?: "unknown error")
+                                Log.w(TAG, "UI tree dump failed: ${error.message}")
+                                null
+                            }
+                        )
+                    } catch (e: Exception) {
+                        registerUiDumpFailure(e.message ?: "unknown error")
+                        Log.w(TAG, "UI tree dump failed: ${e.message}")
                         null
                     }
-                )
-            } catch (e: Exception) {
-                registerUiDumpFailure(e.message ?: "unknown error")
-                Log.w(TAG, "UI tree dump failed: ${e.message}")
-                null
+                }
+                UiDumpTimed(tree, (System.currentTimeMillis() - t0).coerceAtLeast(0L))
             }
+            val scr = screenshotDeferred.await()
+            val dump = uiDumpDeferred.await()
+            ParallelCaptureResult(scr.result, dump.tree, scr.ms, dump.ms)
         }
-        val uiDumpMs = (System.currentTimeMillis() - uiDumpStartedAt).coerceAtLeast(0L)
+
+        val screenshotResult = parallelResult.screenshotResult
+        val uiTreeResult = parallelResult.uiTreeResult
+        val screenshotMs = parallelResult.screenshotMs
+        val uiDumpMs = parallelResult.uiDumpMs
         val uiTree = uiTreeResult?.text
         if (uiTreeResult != null) {
             currentElementMap = uiTreeResult.elementMap
@@ -1038,6 +1966,7 @@ class AgentEngine(
             screenshotWidth = screenshotWidth,
             screenshotHeight = screenshotHeight,
             uiTree = uiTree,
+            uiTreeResult = uiTreeResult,
             timing = TimingBreakdown(
                 screenshotMs = screenshotMs,
                 uiDumpMs = uiDumpMs,
@@ -1102,6 +2031,40 @@ class AgentEngine(
                     ))
                 }
                 "Tapped element #$elementId at ($x, $y) and input '$text'"
+            }
+
+            "tap_element_sequence" -> {
+                val elements = args["elements"]?.jsonArray
+                    ?.map { it.jsonPrimitive.int }
+                    ?: throw IllegalArgumentException("tap_element_sequence requires 'elements'")
+                if (elements.isEmpty()) {
+                    throw IllegalArgumentException("tap_element_sequence requires at least one element")
+                }
+                if (elements.size > TAP_SEQUENCE_MAX_ELEMENTS) {
+                    throw IllegalArgumentException(
+                        "tap_element_sequence supports at most $TAP_SEQUENCE_MAX_ELEMENTS elements"
+                    )
+                }
+
+                val intervalMs = (args["interval_ms"]?.jsonPrimitive?.intOrNull
+                    ?: TAP_SEQUENCE_DEFAULT_INTERVAL_MS)
+                    .coerceIn(0, TAP_SEQUENCE_MAX_INTERVAL_MS)
+                val coords = elements.map { elementId ->
+                    currentElementMap[elementId]
+                        ?: throw IllegalArgumentException(
+                            "Element #$elementId not found (available: ${currentElementMap.keys.sorted()})"
+                        )
+                }
+
+                Log.d(TAG, "tap_element_sequence ${elements.joinToString(prefix = "[", postfix = "]")}")
+                coords.forEachIndexed { index, (x, y) ->
+                    adbExecutor.tap(x, y).getOrThrow()
+                    if (index != coords.lastIndex && intervalMs > 0) {
+                        delay(intervalMs.toLong())
+                    }
+                }
+
+                "Tapped ${elements.size} elements in sequence: ${elements.joinToString(" -> ") { "#$it" }}"
             }
 
             "tap" -> {
@@ -1447,6 +2410,13 @@ class AgentEngine(
         val skipReason: String = ""
     )
 
+    private fun settleDelayForTool(toolName: String): Long {
+        return when (toolName) {
+            "tap_element_sequence" -> TAP_SEQUENCE_SETTLE_DELAY_MS
+            else -> ACTION_SETTLE_DELAY_MS
+        }
+    }
+
     private fun planToolExecution(toolCalls: List<ToolCall>): List<PlannedToolExecution> {
         if (toolCalls.isEmpty()) return emptyList()
 
@@ -1754,7 +2724,11 @@ class AgentEngine(
      */
     data class UiTreeResult(
         val text: String,
-        val elementMap: Map<Int, Pair<Int, Int>>
+        val elementMap: Map<Int, Pair<Int, Int>>,
+        val packageName: String,
+        val activeText: String,
+        val visibleTexts: List<String>,
+        val tokenElementMap: Map<String, Int>
     )
 
     /**
@@ -1768,6 +2742,10 @@ class AgentEngine(
         try {
             val lines = mutableListOf<String>()
             val elementMap = mutableMapOf<Int, Pair<Int, Int>>()
+            val visibleTexts = linkedSetOf<String>()
+            val tokenElementMap = linkedMapOf<String, Int>()
+            var packageName = ""
+            var activeText = ""
             var elementNumber = 0
             val boundsRegex = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
 
@@ -1787,11 +2765,20 @@ class AgentEngine(
                 val bounds = attrs["bounds"] ?: ""
                 val clickable = attrs["clickable"] == "true"
                 val focusable = attrs["focusable"] == "true"
+                val focused = attrs["focused"] == "true"
                 val enabled = attrs["enabled"] != "false"
                 val visible = attrs["visible-to-user"] != "false"
+                if (packageName.isBlank()) {
+                    packageName = attrs["package"].orEmpty()
+                }
 
                 if (!visible) continue
                 if (text.isEmpty() && contentDesc.isEmpty() && resourceId.isEmpty() && !clickable) continue
+                if (text.isNotBlank()) visibleTexts += text
+                if (contentDesc.isNotBlank()) visibleTexts += contentDesc
+                if ((focused || className.endsWith("EditText")) && text.isNotBlank()) {
+                    activeText = text
+                }
 
                 val isInteractive = clickable || focusable
 
@@ -1811,6 +2798,13 @@ class AgentEngine(
                         val centerX = (left + right) / 2
                         val centerY = (top + bottom) / 2
                         elementMap[elementNumber] = Pair(centerX, centerY)
+                    }
+                    deriveStableKeypadToken(
+                        resourceId = resourceId.substringAfterLast("/"),
+                        text = text,
+                        contentDesc = contentDesc
+                    )?.let { token ->
+                        tokenElementMap.putIfAbsent(token, elementNumber)
                     }
                 }
 
@@ -1834,7 +2828,14 @@ class AgentEngine(
             } else {
                 lines.joinToString("\n")
             }
-            return UiTreeResult(text = resultText, elementMap = elementMap)
+            return UiTreeResult(
+                text = resultText,
+                elementMap = elementMap,
+                packageName = packageName,
+                activeText = activeText,
+                visibleTexts = visibleTexts.toList(),
+                tokenElementMap = tokenElementMap
+            )
         } catch (e: Exception) {
             Log.w(TAG, "Failed to simplify UI tree: ${e.message}")
             return null

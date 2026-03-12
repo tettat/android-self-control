@@ -448,8 +448,8 @@ class FloatingBubbleService : Service() {
 
         val color = when {
             tool in setOf("tap", "tap_element", "tap_region", "swipe", "scroll_down", "scroll_up", "press_back", "press_home", "key_event") -> COLOR_NAVIGATION
-            tool in setOf("input_text", "input_element") -> COLOR_INPUT
-            tool in setOf("launch_app", "load_skills", "zoom_region") -> COLOR_FOCUS
+            tool in setOf("input_text", "input_element", "tap_element_sequence") -> COLOR_INPUT
+            tool in setOf("launch_app", "load_skills", "zoom_region", "stable_keypad_fast_path") -> COLOR_FOCUS
             tool == "adb_shell" -> COLOR_SYSTEM
             tool == "wait" -> COLOR_WAIT
             tool == "complete" -> COLOR_COMPLETE
