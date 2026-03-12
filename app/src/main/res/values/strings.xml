@@ -14,4 +14,5 @@
     <string name="stop_listening">Stop Listening</string>
     <string name="permission_required">Permission required</string>
     <string name="grant_permission">Grant Permission</string>
+    <string name="accessibility_service_description">用于快速读取当前界面组件树，减少 ADB UI dump 延迟。</string>
 </resources>

@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Base64
 import android.util.Log
+import com.control.app.service.UiTreeAccessibilityService
 import io.github.muntashirakon.adb.AdbStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -26,6 +27,7 @@ class AdbExecutor(private val context: Context) {
     companion object {
         private const val TAG = "AdbExecutor"
         private const val SCREENSHOT_PATH = "/data/local/tmp/ctrl_screenshot.png"
+        private const val UI_DUMP_PATH = "/data/local/tmp/ui_dump.xml"
         private const val LOCALHOST = "127.0.0.1"
         private const val DEFAULT_CONNECT_TIMEOUT_MS = 10_000
         private const val MAX_RECONNECT_ATTEMPTS = 2
@@ -247,20 +249,46 @@ class AdbExecutor(private val context: Context) {
      * May return empty array on transient failure.
      */
     private fun fetchScreenshotBytes(): ByteArray {
-        return try {
+        val directBytes = try {
             val stream = openStreamWithReconnect("shell:screencap -p")
-            val bytes = readStreamBytes(stream, SCREENSHOT_TIMEOUT_MS)
-            stream.close()
-            bytes
-        } catch (e: Exception) {
-            Log.w(TAG, "Direct screencap stream failed, falling back to temp file: ${e.message}")
             try {
-                screenshotViaFile()
-            } catch (e2: Exception) {
-                Log.w(TAG, "Screenshot via file also failed: ${e2.message}")
-                ByteArray(0)
+                readStreamBytes(stream, SCREENSHOT_TIMEOUT_MS)
+            } finally {
+                runCatching { stream.close() }
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "Direct screencap stream failed, will try temp file fallback: ${e.message}")
+            ByteArray(0)
         }
+
+        if (looksLikePng(directBytes)) {
+            return directBytes
+        }
+        if (directBytes.isNotEmpty()) {
+            Log.w(TAG, "Direct screencap returned non-PNG or truncated data (${directBytes.size} bytes), trying temp file fallback")
+        } else {
+            Log.w(TAG, "Direct screencap returned empty data, trying temp file fallback")
+        }
+
+        return try {
+            screenshotViaFile().also { fileBytes ->
+                if (!looksLikePng(fileBytes) && fileBytes.isNotEmpty()) {
+                    Log.w(TAG, "Screenshot via file returned non-PNG or truncated data (${fileBytes.size} bytes)")
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Screenshot via file also failed: ${e.message}")
+            ByteArray(0)
+        }
+    }
+
+    private fun looksLikePng(bytes: ByteArray): Boolean {
+        if (bytes.size < 8) return false
+        val header = byteArrayOf(
+            0x89.toByte(), 0x50, 0x4E, 0x47,
+            0x0D, 0x0A, 0x1A, 0x0A
+        )
+        return header.indices.all { index -> bytes[index] == header[index] }
     }
 
     /**
@@ -360,7 +388,21 @@ class AdbExecutor(private val context: Context) {
                     executeCommand("input text \"${escapeAsciiInputText(text)}\"").getOrThrow()
                 } else {
                     Log.w(TAG, "Non-ASCII without ADBKeyboard, using clipboard fallback")
-                    inputTextViaClipboard(text)
+                    try {
+                        inputTextViaClipboard(text)
+                    } catch (clipboardError: Exception) {
+                        if (UiTreeAccessibilityService.isConnected.value) {
+                            Log.w(TAG, "Clipboard fallback unavailable, trying accessibility text injection")
+                            runCatching {
+                                inputTextViaAccessibility(text)
+                            }.getOrElse { accessibilityError ->
+                                clipboardError.addSuppressed(accessibilityError)
+                                throw clipboardError
+                            }
+                        } else {
+                            throw clipboardError
+                        }
+                    }
                 }
             }
         }
@@ -409,10 +451,15 @@ class AdbExecutor(private val context: Context) {
         }
 
         throw RuntimeException(
-            "Unicode text input requires ADBKeyboard or a clipboard service that supports shell paste",
+            "Unicode text input requires ADBKeyboard, a clipboard service that supports shell paste, or the app accessibility service",
             lastFailure
         )
     }
+
+    private suspend fun inputTextViaAccessibility(text: String): String =
+        withContext(Dispatchers.Main) {
+            UiTreeAccessibilityService.setTextOnFocusedInput(text).getOrThrow()
+        }
 
     private fun shellSingleQuote(value: String): String = "'${value.replace("'", "'\\''")}'"
 
@@ -473,22 +520,46 @@ class AdbExecutor(private val context: Context) {
 
     suspend fun dumpUiHierarchy(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {
-            val directOutput = executeCommand(
-                "uiautomator dump /dev/tty",
-                timeoutMs = UI_DUMP_COMMAND_TIMEOUT_MS
-            ).getOrThrow()
-            extractUiHierarchyXml(directOutput)?.let { return@runCatching it }
+            val directCommands = listOf(
+                "uiautomator dump --compressed /dev/tty 2>/dev/null",
+                "uiautomator dump /dev/tty 2>/dev/null"
+            )
+            for (command in directCommands) {
+                val output = executeCommand(
+                    command,
+                    timeoutMs = UI_DUMP_COMMAND_TIMEOUT_MS
+                ).getOrThrow()
+                extractUiHierarchyXml(output)?.let { return@runCatching it }
+            }
 
-            executeCommand(
-                "uiautomator dump /data/local/tmp/ui_dump.xml 2>&1",
-                timeoutMs = UI_DUMP_COMMAND_TIMEOUT_MS
-            ).getOrThrow()
-            val xml = executeCommand(
-                "cat /data/local/tmp/ui_dump.xml",
-                timeoutMs = UI_DUMP_READ_TIMEOUT_MS
-            ).getOrThrow()
-            executeCommand("rm -f /data/local/tmp/ui_dump.xml")
-            extractUiHierarchyXml(xml) ?: xml
+            val fallbackCommands = listOf(
+                buildUiDumpFileCommand(compressed = true),
+                buildUiDumpFileCommand(compressed = false)
+            )
+            for (command in fallbackCommands) {
+                val output = executeCommand(
+                    command,
+                    timeoutMs = UI_DUMP_COMMAND_TIMEOUT_MS + UI_DUMP_READ_TIMEOUT_MS
+                ).getOrThrow()
+                extractUiHierarchyXml(output)?.let { return@runCatching it }
+            }
+
+            throw RuntimeException("uiautomator dump did not return valid XML")
+        }
+    }
+
+    private fun buildUiDumpFileCommand(compressed: Boolean): String {
+        val compressedFlag = if (compressed) "--compressed " else ""
+        return buildString {
+            append("sh -c '")
+            append("uiautomator dump ")
+            append(compressedFlag)
+            append(UI_DUMP_PATH)
+            append(" >/dev/null 2>&1 && cat ")
+            append(UI_DUMP_PATH)
+            append("; rm -f ")
+            append(UI_DUMP_PATH)
+            append("'")
         }
     }
 

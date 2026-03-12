@@ -22,6 +22,7 @@ import com.control.app.data.SettingsStore
 import com.control.app.log.ExecutionLogFormatter
 import com.control.app.prompt.DefaultPrompts
 import com.control.app.prompt.PromptManager
+import com.control.app.service.UiTreeAccessibilityService
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -47,6 +48,11 @@ import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.random.Random
 
 class AgentEngine(
     appContext: Context,
@@ -78,9 +84,17 @@ class AgentEngine(
         private const val TAP_SEQUENCE_MAX_INTERVAL_MS = 250
         private const val TAP_SEQUENCE_MAX_ELEMENTS = 12
         private const val TAP_SEQUENCE_SETTLE_DELAY_MS = 150L
+        private const val TAP_COORD_JITTER_PX = 6
+        private const val REGION_TAP_JITTER_PX = 8
+        private const val SWIPE_COORD_JITTER_PX = 10
+        private const val SWIPE_DURATION_JITTER_RATIO = 0.15f
         private const val MAX_TOOL_CALLS_PER_STEP = 3
         private const val UI_DUMP_FAILURES_BEFORE_COOLDOWN = 2
         private const val UI_DUMP_COOLDOWN_CAPTURES = 5
+        private const val MAX_UI_TREE_LINES = 150
+        private val UI_BOUNDS_REGEX = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+        private val UI_NODE_REGEX = Regex("""<node\s+([^>]+?)/?>\s*""")
+        private val UI_ATTR_REGEX = Regex("""(\w[\w-]*)="([^"]*?)"""")
         /** Compress history when message count exceeds this threshold. */
         private const val MAX_MESSAGES_BEFORE_COMPRESSION = 30
         /** Number of recent messages to keep verbatim during compression. */
@@ -143,6 +157,10 @@ class AgentEngine(
 
     /** Scale factor used for the current screenshot, for coordinate conversion. */
     private var currentScreenshotScale: Float = 1.0f
+
+    /** Last screenshot size in pixels (model input size, before scaling to screen). */
+    private var lastScreenshotWidth: Int = 0
+    private var lastScreenshotHeight: Int = 0
 
     /** Most recent screenshot base64 for tap annotation overlay. */
     private var lastScreenshotBase64: String? = null
@@ -1178,10 +1196,7 @@ class AgentEngine(
     ): UiTreeResult? {
         var lastTree: UiTreeResult? = null
         repeat(CALCULATOR_UI_MAX_ATTEMPTS) { attempt ->
-            val tree = runCatching {
-                val rawXml = adbExecutor.dumpUiHierarchy().getOrThrow()
-                withContext(Dispatchers.Default) { simplifyUiTree(rawXml) }
-            }.getOrNull()
+            val tree = captureUiTreeResultFromBestAvailableSource(ignoreCooldown = true)
             if (tree != null) {
                 lastTree = tree
                 if (plan == null || hasStableKeypadCoverage(plan, tree)) {
@@ -1395,10 +1410,30 @@ class AgentEngine(
         }
     }
 
+    private fun buildStableKeypadSnapshot(uiTreeResult: UiTreeResult): StableKeypadSnapshot? {
+        if (uiTreeResult.tokenElementMap.isEmpty()) return null
+        val tokenCenters = buildMap {
+            uiTreeResult.tokenElementMap.forEach { (token, elementId) ->
+                uiTreeResult.elementMap[elementId]?.let { put(token, it) }
+            }
+        }
+        if (tokenCenters.isEmpty()) return null
+        return StableKeypadSnapshot(
+            packageName = uiTreeResult.packageName,
+            activeText = uiTreeResult.activeText,
+            visibleTexts = uiTreeResult.visibleTexts,
+            tokenCenters = tokenCenters
+        )
+    }
+
     private suspend fun dumpStableKeypadSnapshotWithRetry(): StableKeypadSnapshot {
         var lastError: Throwable? = null
         repeat(CALCULATOR_UI_MAX_ATTEMPTS) { attempt ->
             try {
+                captureAccessibilityUiTree()?.let { accessibilityTree ->
+                    return buildStableKeypadSnapshot(accessibilityTree)
+                        ?: throw IllegalStateException("无法识别当前稳定键盘")
+                }
                 val rawXml = adbExecutor.dumpUiHierarchy().getOrThrow()
                 return parseStableKeypadSnapshot(rawXml)
                     ?: throw IllegalStateException("无法识别当前稳定键盘")
@@ -1886,34 +1921,7 @@ class AgentEngine(
             }
             val uiDumpDeferred = async {
                 val t0 = System.currentTimeMillis()
-                val tree = if (uiDumpCooldownRemaining > 0) {
-                    uiDumpCooldownRemaining--
-                    Log.d(TAG, "Skipping UI dump due to cooldown, remaining=$uiDumpCooldownRemaining")
-                    null
-                } else {
-                    try {
-                        adbExecutor.dumpUiHierarchy().fold(
-                            onSuccess = { rawXml ->
-                                if (rawXml.isBlank()) {
-                                    registerUiDumpFailure("uiautomator dump returned empty XML")
-                                    null
-                                } else {
-                                    uiDumpFailureStreak = 0
-                                    withContext(Dispatchers.Default) { simplifyUiTree(rawXml) }
-                                }
-                            },
-                            onFailure = { error ->
-                                registerUiDumpFailure(error.message ?: "unknown error")
-                                Log.w(TAG, "UI tree dump failed: ${error.message}")
-                                null
-                            }
-                        )
-                    } catch (e: Exception) {
-                        registerUiDumpFailure(e.message ?: "unknown error")
-                        Log.w(TAG, "UI tree dump failed: ${e.message}")
-                        null
-                    }
-                }
+                val tree = captureUiTreeResultFromBestAvailableSource()
                 UiDumpTimed(tree, (System.currentTimeMillis() - t0).coerceAtLeast(0L))
             }
             val scr = screenshotDeferred.await()
@@ -1942,9 +1950,22 @@ class AgentEngine(
             } else {
                 "截图失败: ${e.message}"
             }
-            addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "截图错误", content = errMsg))
-            Log.e(TAG, errMsg, e)
-            throw RuntimeException(errMsg, e)
+
+            if (uiTreeResult != null) {
+                addLog(
+                    DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "截图降级",
+                        content = "$errMsg\n已回退为 UI 树占位图，继续执行。"
+                    )
+                )
+                Log.w(TAG, "$errMsg; falling back to UI-tree placeholder", e)
+                buildUiTreePlaceholderBitmap(uiTreeResult, screenshotScale)
+            } else {
+                addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "截图错误", content = errMsg))
+                Log.e(TAG, errMsg, e)
+                throw RuntimeException(errMsg, e)
+            }
         }
 
         // Encode screenshot to base64
@@ -1957,6 +1978,8 @@ class AgentEngine(
 
         // Update scale factor for coordinate conversion
         currentScreenshotScale = screenshotScale
+        lastScreenshotWidth = screenshotWidth
+        lastScreenshotHeight = screenshotHeight
 
         // Save for tap annotation overlay
         lastScreenshotBase64 = imageBase64
@@ -1975,6 +1998,181 @@ class AgentEngine(
         )
     }
 
+    private suspend fun captureUiTreeResultFromBestAvailableSource(
+        ignoreCooldown: Boolean = false
+    ): UiTreeResult? {
+        captureAccessibilityUiTree()?.let { tree ->
+            uiDumpFailureStreak = 0
+            return tree
+        }
+
+        if (!ignoreCooldown && uiDumpCooldownRemaining > 0) {
+            uiDumpCooldownRemaining--
+            Log.d(TAG, "Skipping UI dump due to cooldown, remaining=$uiDumpCooldownRemaining")
+            return null
+        }
+
+        return try {
+            adbExecutor.dumpUiHierarchy().fold(
+                onSuccess = { rawXml ->
+                    if (rawXml.isBlank()) {
+                        registerUiDumpFailure("uiautomator dump returned empty XML")
+                        null
+                    } else {
+                        uiDumpFailureStreak = 0
+                        withContext(Dispatchers.Default) { simplifyUiTree(rawXml) }
+                    }
+                },
+                onFailure = { error ->
+                    registerUiDumpFailure(error.message ?: "unknown error")
+                    Log.w(TAG, "UI tree dump failed: ${error.message}")
+                    null
+                }
+            )
+        } catch (e: Exception) {
+            registerUiDumpFailure(e.message ?: "unknown error")
+            Log.w(TAG, "UI tree dump failed: ${e.message}")
+            null
+        }
+    }
+
+    private suspend fun captureAccessibilityUiTree(): UiTreeResult? {
+        val snapshot = withContext(Dispatchers.Main.immediate) {
+            UiTreeAccessibilityService.captureSnapshot()
+        } ?: return null
+        return simplifyAccessibilityTree(snapshot)
+    }
+
+    private fun buildUiTreePlaceholderBitmap(
+        uiTreeResult: UiTreeResult,
+        screenshotScale: Float
+    ): Bitmap {
+        val safeScale = screenshotScale.takeIf { it > 0f } ?: 0.5f
+        val width = if (lastScreenshotWidth > 0) {
+            lastScreenshotWidth
+        } else {
+            (1080 * safeScale).roundToInt().coerceAtLeast(360)
+        }
+        val height = if (lastScreenshotHeight > 0) {
+            lastScreenshotHeight
+        } else {
+            (2400 * safeScale).roundToInt().coerceAtLeast(640)
+        }
+
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(Color.rgb(18, 18, 18))
+
+        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 30f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+        val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(235, 230, 230, 230)
+            textSize = 20f
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        val hintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(220, 129, 199, 132)
+            textSize = 22f
+        }
+
+        var y = 48f
+        canvas.drawText("Screenshot unavailable", 24f, y, titlePaint)
+        y += 34f
+        canvas.drawText("Using UI tree fallback for this screen.", 24f, y, hintPaint)
+        y += 38f
+        canvas.drawText("package=${uiTreeResult.packageName}", 24f, y, bodyPaint)
+        y += 28f
+        if (uiTreeResult.activeText.isNotBlank()) {
+            canvas.drawText("active=${uiTreeResult.activeText.take(60)}", 24f, y, bodyPaint)
+            y += 28f
+        }
+        y += 8f
+
+        val maxTextWidth = width - 48f
+        val maxLines = ((height - y - 24f) / 26f).toInt().coerceAtLeast(1)
+        val flattenedLines = uiTreeResult.text.lines().filter { it.isNotBlank() }
+        val renderedLines = mutableListOf<String>()
+        for (line in flattenedLines) {
+            if (renderedLines.size >= maxLines) break
+            val chunks = wrapTextForWidth(line, bodyPaint, maxTextWidth)
+            for (chunk in chunks) {
+                if (renderedLines.size >= maxLines) break
+                renderedLines += chunk
+            }
+        }
+
+        renderedLines.forEach { line ->
+            canvas.drawText(line, 24f, y, bodyPaint)
+            y += 26f
+        }
+        if (flattenedLines.size > renderedLines.size) {
+            canvas.drawText("...", 24f, y, bodyPaint)
+        }
+
+        return bitmap
+    }
+
+    private fun wrapTextForWidth(
+        text: String,
+        paint: Paint,
+        maxWidth: Float
+    ): List<String> {
+        if (text.isBlank()) return emptyList()
+        val result = mutableListOf<String>()
+        var remaining = text.trim()
+        while (remaining.isNotEmpty()) {
+            val count = paint.breakText(remaining, true, maxWidth, null).coerceAtLeast(1)
+            result += remaining.substring(0, count)
+            remaining = remaining.substring(count).trimStart()
+        }
+        return result
+    }
+
+    private fun jitterScreenCoords(x: Int, y: Int, maxJitterPx: Int): Pair<Int, Int> {
+        if (maxJitterPx <= 0) return x to y
+
+        val effectiveScale = if (currentScreenshotScale > 0f) currentScreenshotScale else 1.0f
+        val screenWidth = if (lastScreenshotWidth > 0) {
+            (lastScreenshotWidth / effectiveScale).roundToInt().coerceAtLeast(1)
+        } else {
+            null
+        }
+        val screenHeight = if (lastScreenshotHeight > 0) {
+            (lastScreenshotHeight / effectiveScale).roundToInt().coerceAtLeast(1)
+        } else {
+            null
+        }
+
+        var jitteredX = x + Random.nextInt(-maxJitterPx, maxJitterPx + 1)
+        var jitteredY = y + Random.nextInt(-maxJitterPx, maxJitterPx + 1)
+
+        if (jitteredX < 0) jitteredX = 0
+        if (jitteredY < 0) jitteredY = 0
+
+        screenWidth?.let { w ->
+            if (w > 0) {
+                jitteredX = jitteredX.coerceAtMost(w - 1)
+            }
+        }
+        screenHeight?.let { h ->
+            if (h > 0) {
+                jitteredY = jitteredY.coerceAtMost(h - 1)
+            }
+        }
+
+        return jitteredX to jitteredY
+    }
+
+    private fun jitterDurationMs(baseMs: Int, relativeRange: Float, minMs: Int = 50): Int {
+        if (relativeRange <= 0f) return baseMs.coerceAtLeast(minMs)
+        val span = (baseMs * relativeRange).roundToInt().coerceAtLeast(1)
+        val jittered = baseMs + Random.nextInt(-span, span + 1)
+        return jittered.coerceAtLeast(minMs)
+    }
+
     /**
      * Execute a single tool call from the AI. Returns a result string.
      */
@@ -1984,9 +2182,10 @@ class AgentEngine(
             "tap_element" -> {
                 val elementId = args["element"]?.jsonPrimitive?.int
                     ?: throw IllegalArgumentException("tap_element requires 'element' parameter")
-                val (x, y) = currentElementMap[elementId]
+                val (origX, origY) = currentElementMap[elementId]
                     ?: throw IllegalArgumentException("Element #$elementId not found (available: ${currentElementMap.keys.sorted()})")
-                Log.d(TAG, "tap_element #$elementId -> ($x, $y)")
+                val (x, y) = jitterScreenCoords(origX, origY, TAP_COORD_JITTER_PX)
+                Log.d(TAG, "tap_element #$elementId -> ($origX, $origY) jittered to ($x, $y)")
                 adbExecutor.tap(x, y).getOrThrow()
                 // Annotate screenshot with tap position
                 val scale = currentScreenshotScale
@@ -1998,7 +2197,7 @@ class AgentEngine(
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "点击位置标注",
-                        content = "tap_element #$elementId 实际坐标($x,$y) 截图坐标($scrX,$scrY)",
+                        content = "tap_element #$elementId 目标坐标($origX,$origY) 实际坐标($x,$y) 截图坐标($scrX,$scrY)",
                         imageBase64 = annotated
                     ))
                 }
@@ -2010,9 +2209,10 @@ class AgentEngine(
                     ?: throw IllegalArgumentException("input_element requires 'element' parameter")
                 val text = args["text"]?.jsonPrimitive?.content
                     ?: throw IllegalArgumentException("input_element requires 'text' parameter")
-                val (x, y) = currentElementMap[elementId]
+                val (origX, origY) = currentElementMap[elementId]
                     ?: throw IllegalArgumentException("Element #$elementId not found (available: ${currentElementMap.keys.sorted()})")
-                Log.d(TAG, "input_element #$elementId -> tap($x, $y) then input '$text'")
+                val (x, y) = jitterScreenCoords(origX, origY, TAP_COORD_JITTER_PX)
+                Log.d(TAG, "input_element #$elementId -> tap($origX, $origY) jittered to ($x, $y) then input '$text'")
                 adbExecutor.tap(x, y).getOrThrow()
                 delay(300)
                 adbExecutor.inputText(text).getOrThrow()
@@ -2026,7 +2226,7 @@ class AgentEngine(
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "点击位置标注",
-                        content = "input_element #$elementId 实际坐标($x,$y) 截图坐标($scrX,$scrY) 输入'$text'",
+                        content = "input_element #$elementId 目标坐标($origX,$origY) 实际坐标($x,$y) 截图坐标($scrX,$scrY) 输入'$text'",
                         imageBase64 = annotated
                     ))
                 }
@@ -2049,19 +2249,40 @@ class AgentEngine(
                 val intervalMs = (args["interval_ms"]?.jsonPrimitive?.intOrNull
                     ?: TAP_SEQUENCE_DEFAULT_INTERVAL_MS)
                     .coerceIn(0, TAP_SEQUENCE_MAX_INTERVAL_MS)
-                val coords = elements.map { elementId ->
+                val baseCoords = elements.map { elementId ->
                     currentElementMap[elementId]
                         ?: throw IllegalArgumentException(
                             "Element #$elementId not found (available: ${currentElementMap.keys.sorted()})"
                         )
                 }
 
+                val jitteredCoords = baseCoords.map { (x, y) ->
+                    jitterScreenCoords(x, y, TAP_COORD_JITTER_PX)
+                }
+
                 Log.d(TAG, "tap_element_sequence ${elements.joinToString(prefix = "[", postfix = "]")}")
-                coords.forEachIndexed { index, (x, y) ->
+                jitteredCoords.forEachIndexed { index, (x, y) ->
                     adbExecutor.tap(x, y).getOrThrow()
-                    if (index != coords.lastIndex && intervalMs > 0) {
+                    if (index != jitteredCoords.lastIndex && intervalMs > 0) {
                         delay(intervalMs.toLong())
                     }
+                }
+                lastScreenshotBase64?.let { screenshot ->
+                    val screenshotPoints = jitteredCoords.map { (x, y) -> mapScreenPointToScreenshot(x, y) }
+                    val annotated = annotateScreenshotWithSequence(
+                        imageBase64 = screenshot,
+                        points = screenshotPoints,
+                        label = "tap_element_sequence"
+                    )
+                    addLog(DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "连续点击路径标注",
+                        content = buildString {
+                            appendLine("elements=${elements.joinToString(prefix = "[", postfix = "]")}")
+                            append("实际坐标=${jitteredCoords.joinToString(prefix = "[", postfix = "]") { "(${it.first},${it.second})" }}")
+                        },
+                        imageBase64 = annotated
+                    ))
                 }
 
                 "Tapped ${elements.size} elements in sequence: ${elements.joinToString(" -> ") { "#$it" }}"
@@ -2073,18 +2294,20 @@ class AgentEngine(
                 val rawY = args["y"]?.jsonPrimitive?.int
                     ?: throw IllegalArgumentException("tap requires 'y' parameter")
                 val scale = currentScreenshotScale
-                val x = if (scale > 0f && scale < 1f) (rawX / scale).toInt() else rawX
-                val y = if (scale > 0f && scale < 1f) (rawY / scale).toInt() else rawY
-                Log.d(TAG, "tap: AI coords ($rawX, $rawY) -> screen coords ($x, $y) [scale=$scale]")
+                val baseX = if (scale > 0f && scale < 1f) (rawX / scale).toInt() else rawX
+                val baseY = if (scale > 0f && scale < 1f) (rawY / scale).toInt() else rawY
+                val (x, y) = jitterScreenCoords(baseX, baseY, TAP_COORD_JITTER_PX)
+                Log.d(TAG, "tap: AI coords ($rawX, $rawY) -> base screen coords ($baseX, $baseY) jittered to ($x, $y) [scale=$scale]")
                 adbExecutor.tap(x, y).getOrThrow()
-                // Annotate screenshot with tap position (rawX/rawY are already in screenshot coords)
+                // Annotate screenshot with tap position
                 lastScreenshotBase64?.let { screenshot ->
-                    val label = "tap ($rawX,$rawY)->($x,$y)"
-                    val annotated = annotateScreenshotWithTap(screenshot, rawX, rawY, label)
+                    val (scrX, scrY) = mapScreenPointToScreenshot(x, y)
+                    val label = "tap ($rawX,$rawY)->($scrX,$scrY)"
+                    val annotated = annotateScreenshotWithTap(screenshot, scrX, scrY, label)
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "点击位置标注",
-                        content = "tap 截图坐标($rawX,$rawY) 实际坐标($x,$y)",
+                        content = "tap 截图目标坐标($rawX,$rawY) 实际屏幕坐标($x,$y) 实际截图坐标($scrX,$scrY)",
                         imageBase64 = annotated
                     ))
                 }
@@ -2102,12 +2325,32 @@ class AgentEngine(
                     ?: throw IllegalArgumentException("swipe requires 'endY'")
                 val duration = args["duration"]?.jsonPrimitive?.intOrNull ?: 300
                 val scale = currentScreenshotScale
-                val sx = if (scale > 0f && scale < 1f) (rawSx / scale).toInt() else rawSx
-                val sy = if (scale > 0f && scale < 1f) (rawSy / scale).toInt() else rawSy
-                val ex = if (scale > 0f && scale < 1f) (rawEx / scale).toInt() else rawEx
-                val ey = if (scale > 0f && scale < 1f) (rawEy / scale).toInt() else rawEy
-                adbExecutor.swipe(sx, sy, ex, ey, duration).getOrThrow()
-                "Swiped from ($sx,$sy) to ($ex,$ey) in ${duration}ms"
+                val baseSx = if (scale > 0f && scale < 1f) (rawSx / scale).toInt() else rawSx
+                val baseSy = if (scale > 0f && scale < 1f) (rawSy / scale).toInt() else rawSy
+                val baseEx = if (scale > 0f && scale < 1f) (rawEx / scale).toInt() else rawEx
+                val baseEy = if (scale > 0f && scale < 1f) (rawEy / scale).toInt() else rawEy
+                val (sx, sy) = jitterScreenCoords(baseSx, baseSy, SWIPE_COORD_JITTER_PX)
+                val (ex, ey) = jitterScreenCoords(baseEx, baseEy, SWIPE_COORD_JITTER_PX)
+                val jitteredDuration = jitterDurationMs(duration, SWIPE_DURATION_JITTER_RATIO)
+                adbExecutor.swipe(sx, sy, ex, ey, jitteredDuration).getOrThrow()
+                lastScreenshotBase64?.let { screenshot ->
+                    val label = "swipe ($rawSx,$rawSy)->($rawEx,$rawEy)"
+                    val annotated = annotateScreenshotWithSwipe(
+                        imageBase64 = screenshot,
+                        startX = rawSx,
+                        startY = rawSy,
+                        endX = rawEx,
+                        endY = rawEy,
+                        label = label
+                    )
+                    addLog(DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "滑动路径标注",
+                        content = "swipe 截图起点($rawSx,$rawSy) 终点($rawEx,$rawEy) 实际起点($sx,$sy) 终点($ex,$ey) 时长${jitteredDuration}ms",
+                        imageBase64 = annotated
+                    ))
+                }
+                "Swiped from ($sx,$sy) to ($ex,$ey) in ${jitteredDuration}ms"
             }
 
             "launch_app" -> {
@@ -2129,11 +2372,45 @@ class AgentEngine(
 
             "scroll_down" -> {
                 adbExecutor.scrollDown().getOrThrow()
+                lastScreenshotBase64?.let { screenshot ->
+                    val (sx, sy, ex, ey) = buildViewportScrollPath(isDown = true, screenshot)
+                    val annotated = annotateScreenshotWithSwipe(
+                        imageBase64 = screenshot,
+                        startX = sx,
+                        startY = sy,
+                        endX = ex,
+                        endY = ey,
+                        label = "scroll_down"
+                    )
+                    addLog(DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "滚动路径标注",
+                        content = "scroll_down 当前视图路径($sx,$sy)->($ex,$ey)",
+                        imageBase64 = annotated
+                    ))
+                }
                 "Scrolled down"
             }
 
             "scroll_up" -> {
                 adbExecutor.scrollUp().getOrThrow()
+                lastScreenshotBase64?.let { screenshot ->
+                    val (sx, sy, ex, ey) = buildViewportScrollPath(isDown = false, screenshot)
+                    val annotated = annotateScreenshotWithSwipe(
+                        imageBase64 = screenshot,
+                        startX = sx,
+                        startY = sy,
+                        endX = ex,
+                        endY = ey,
+                        label = "scroll_up"
+                    )
+                    addLog(DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "滚动路径标注",
+                        content = "scroll_up 当前视图路径($sx,$sy)->($ex,$ey)",
+                        imageBase64 = annotated
+                    ))
+                }
                 "Scrolled up"
             }
 
@@ -2219,8 +2496,9 @@ class AgentEngine(
                     ?: throw IllegalArgumentException("tap_region requires 'region' parameter")
                 if (region !in 1..9) throw IllegalArgumentException("region must be 1-9, got $region")
 
-                val (x, y) = getZoneCenterCoords(region)
-                Log.d(TAG, "tap_region $region -> ($x, $y), zoomRect=$currentZoomRect")
+                val (baseX, baseY) = getZoneCenterCoords(region)
+                val (x, y) = jitterScreenCoords(baseX, baseY, REGION_TAP_JITTER_PX)
+                Log.d(TAG, "tap_region $region -> base ($baseX, $baseY) jittered to ($x, $y), zoomRect=$currentZoomRect")
 
                 adbExecutor.tap(x, y).getOrThrow()
 
@@ -2398,6 +2676,8 @@ class AgentEngine(
     private fun resetCaptureStateForNewTask() {
         currentElementMap = emptyMap()
         currentScreenshotScale = 1.0f
+        lastScreenshotWidth = 0
+        lastScreenshotHeight = 0
         lastScreenshotBase64 = null
         currentZoomRect = null
         uiDumpCooldownRemaining = 0
@@ -2578,6 +2858,218 @@ class AgentEngine(
         return result
     }
 
+    private fun annotateScreenshotWithSwipe(
+        imageBase64: String,
+        startX: Int,
+        startY: Int,
+        endX: Int,
+        endY: Int,
+        label: String
+    ): String {
+        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
+        val original = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(annotated)
+        canvas.drawBitmap(original, 0f, 0f, null)
+        original.recycle()
+
+        val pathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.RED
+            style = Paint.Style.STROKE
+            strokeWidth = 8f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        canvas.drawLine(startX.toFloat(), startY.toFloat(), endX.toFloat(), endY.toFloat(), pathPaint)
+
+        val angle = atan2((endY - startY).toFloat(), (endX - startX).toFloat())
+        val arrowLength = 30f
+        val arrowSpread = 0.55f
+        val arrowX1 = endX - arrowLength * cos(angle - arrowSpread)
+        val arrowY1 = endY - arrowLength * sin(angle - arrowSpread)
+        val arrowX2 = endX - arrowLength * cos(angle + arrowSpread)
+        val arrowY2 = endY - arrowLength * sin(angle + arrowSpread)
+        canvas.drawLine(endX.toFloat(), endY.toFloat(), arrowX1.toFloat(), arrowY1.toFloat(), pathPaint)
+        canvas.drawLine(endX.toFloat(), endY.toFloat(), arrowX2.toFloat(), arrowY2.toFloat(), pathPaint)
+
+        val startPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(220, 0, 200, 83)
+            style = Paint.Style.FILL
+        }
+        val endPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(220, 244, 67, 54)
+            style = Paint.Style.FILL
+        }
+        val markerOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+        }
+        canvas.drawCircle(startX.toFloat(), startY.toFloat(), 14f, startPaint)
+        canvas.drawCircle(endX.toFloat(), endY.toFloat(), 14f, endPaint)
+        canvas.drawCircle(startX.toFloat(), startY.toFloat(), 18f, markerOutlinePaint)
+        canvas.drawCircle(endX.toFloat(), endY.toFloat(), 18f, markerOutlinePaint)
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 28f
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(160, 0, 0, 0)
+            style = Paint.Style.FILL
+        }
+        drawAnnotationLabel(canvas, textPaint, bgPaint, "START", startX + 24f, startY - 20f)
+        drawAnnotationLabel(canvas, textPaint, bgPaint, "END", endX + 24f, endY - 20f)
+        drawAnnotationLabel(
+            canvas,
+            textPaint,
+            bgPaint,
+            label,
+            ((startX + endX) / 2f) + 24f,
+            ((startY + endY) / 2f) - 24f
+        )
+
+        val result = bitmapToBase64(annotated)
+        annotated.recycle()
+        return result
+    }
+
+    private fun drawAnnotationLabel(
+        canvas: Canvas,
+        textPaint: Paint,
+        bgPaint: Paint,
+        label: String,
+        textX: Float,
+        textY: Float
+    ) {
+        val textBounds = Rect()
+        textPaint.getTextBounds(label, 0, label.length, textBounds)
+        canvas.drawRect(
+            textX - 4f,
+            textY + textBounds.top - 4f,
+            textX + textBounds.width() + 4f,
+            textY + textBounds.bottom + 4f,
+            bgPaint
+        )
+        canvas.drawText(label, textX, textY, textPaint)
+    }
+
+    private fun annotateScreenshotWithSequence(
+        imageBase64: String,
+        points: List<Pair<Int, Int>>,
+        label: String
+    ): String {
+        if (points.isEmpty()) return imageBase64
+
+        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
+        val original = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(annotated)
+        canvas.drawBitmap(original, 0f, 0f, null)
+        original.recycle()
+
+        val pathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(230, 255, 152, 0)
+            style = Paint.Style.STROKE
+            strokeWidth = 7f
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+        points.zipWithNext { start, end ->
+            canvas.drawLine(
+                start.first.toFloat(),
+                start.second.toFloat(),
+                end.first.toFloat(),
+                end.second.toFloat(),
+                pathPaint
+            )
+        }
+
+        val markerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            style = Paint.Style.FILL
+            textAlign = Paint.Align.CENTER
+            textSize = 24f
+        }
+        val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeWidth = 3f
+        }
+        val numberPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+            textAlign = Paint.Align.CENTER
+            textSize = 24f
+        }
+
+        points.forEachIndexed { index, (x, y) ->
+            markerPaint.color = when (index) {
+                0 -> Color.argb(220, 76, 175, 80)
+                points.lastIndex -> Color.argb(220, 244, 67, 54)
+                else -> Color.argb(220, 255, 152, 0)
+            }
+            canvas.drawCircle(x.toFloat(), y.toFloat(), 18f, markerPaint)
+            canvas.drawCircle(x.toFloat(), y.toFloat(), 21f, outlinePaint)
+            val baseline = y - (numberPaint.descent() + numberPaint.ascent()) / 2f
+            canvas.drawText((index + 1).toString(), x.toFloat(), baseline, numberPaint)
+        }
+
+        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            textSize = 28f
+            color = Color.WHITE
+            style = Paint.Style.FILL
+        }
+        val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(160, 0, 0, 0)
+            style = Paint.Style.FILL
+        }
+        drawAnnotationLabel(
+            canvas,
+            textPaint,
+            bgPaint,
+            label,
+            points.first().first + 28f,
+            points.first().second - 28f
+        )
+
+        val result = bitmapToBase64(annotated)
+        annotated.recycle()
+        return result
+    }
+
+    private fun mapScreenPointToScreenshot(x: Int, y: Int): Pair<Int, Int> {
+        val scale = if (currentScreenshotScale > 0f) currentScreenshotScale else 1.0f
+        val rect = currentZoomRect
+        return if (rect != null) {
+            Pair(
+                ((x - rect.left) * scale).roundToInt(),
+                ((y - rect.top) * scale).roundToInt()
+            )
+        } else {
+            Pair(
+                (x * scale).roundToInt(),
+                (y * scale).roundToInt()
+            )
+        }
+    }
+
+    private fun buildViewportScrollPath(
+        isDown: Boolean,
+        imageBase64: String
+    ): IntArray {
+        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val width = bitmap.width
+        val height = bitmap.height
+        bitmap.recycle()
+
+        val centerX = width / 2
+        val startY = if (isDown) (height * 0.7f).roundToInt() else (height * 0.3f).roundToInt()
+        val endY = if (isDown) (height * 0.3f).roundToInt() else (height * 0.7f).roundToInt()
+        return intArrayOf(centerX, startY, centerX, endY)
+    }
+
     /**
      * Draw a 3x3 grid overlay with zone numbers on the screenshot.
      * Returns the annotated image as base64.
@@ -2731,6 +3223,121 @@ class AgentEngine(
         val tokenElementMap: Map<String, Int>
     )
 
+    private fun simplifyAccessibilityTree(
+        snapshot: UiTreeAccessibilityService.AccessibilityTreeSnapshot
+    ): UiTreeResult? {
+        try {
+            val lines = mutableListOf<String>()
+            val elementMap = mutableMapOf<Int, Pair<Int, Int>>()
+            val visibleTexts = linkedSetOf<String>()
+            val tokenElementMap = linkedMapOf<String, Int>()
+            var packageName = snapshot.packageName
+            var activeText = ""
+            var elementNumber = 0
+
+            snapshot.nodes.forEach { node ->
+                val text = node.text
+                val contentDesc = node.contentDesc
+                val resourceId = node.resourceId
+                val className = node.className
+                val clickable = node.clickable
+                val focusable = node.focusable
+                val focused = node.focused
+                val enabled = node.enabled
+                val visible = node.visible
+                if (packageName.isBlank()) {
+                    packageName = node.packageName
+                }
+
+                if (!visible) return@forEach
+                if (text.isEmpty() && contentDesc.isEmpty() && resourceId.isEmpty() && !clickable) return@forEach
+                if (text.isNotBlank()) visibleTexts += text
+                if (contentDesc.isNotBlank()) visibleTexts += contentDesc
+                if ((focused || className.endsWith("EditText")) && text.isNotBlank()) {
+                    activeText = text
+                }
+
+                val isInteractive = clickable || focusable
+                val shortClass = className.substringAfterLast(".")
+                val line = buildString {
+                    if (isInteractive) {
+                        elementNumber++
+                        append("#")
+                        append(elementNumber)
+                        append(' ')
+                        val centerX = (node.left + node.right) / 2
+                        val centerY = (node.top + node.bottom) / 2
+                        elementMap[elementNumber] = Pair(centerX, centerY)
+                        deriveStableKeypadToken(
+                            resourceId = resourceId.substringAfterLast("/"),
+                            text = text,
+                            contentDesc = contentDesc
+                        )?.let { token ->
+                            tokenElementMap.putIfAbsent(token, elementNumber)
+                        }
+                    }
+
+                    append("[")
+                    append(shortClass)
+                    append("]")
+                    if (text.isNotEmpty()) {
+                        append(' ')
+                        append("\"")
+                        append(text.take(50))
+                        append("\"")
+                    }
+                    if (contentDesc.isNotEmpty() && contentDesc != text) {
+                        append(' ')
+                        append("desc=\"")
+                        append(contentDesc.take(40))
+                        append("\"")
+                    }
+                    if (resourceId.isNotEmpty()) {
+                        append(' ')
+                        append("id=")
+                        append(resourceId.substringAfterLast("/"))
+                    }
+
+                    var needsFlagSeparator = true
+                    if (clickable) {
+                        append(' ')
+                        append("clickable")
+                        needsFlagSeparator = false
+                    }
+                    if (focusable) {
+                        append(if (needsFlagSeparator) ' ' else ',')
+                        append("focusable")
+                        needsFlagSeparator = false
+                    }
+                    if (!enabled) {
+                        append(if (needsFlagSeparator) ' ' else ',')
+                        append("disabled")
+                    }
+                }
+
+                lines.add(line)
+            }
+
+            if (lines.isEmpty()) return null
+            val resultText = if (lines.size > MAX_UI_TREE_LINES) {
+                lines.take(MAX_UI_TREE_LINES).joinToString("\n") + "\n... (${lines.size - MAX_UI_TREE_LINES} more nodes)"
+            } else {
+                lines.joinToString("\n")
+            }
+            return UiTreeResult(
+                text = resultText,
+                elementMap = elementMap,
+                packageName = packageName,
+                activeText = activeText,
+                visibleTexts = visibleTexts.toList(),
+                tokenElementMap = tokenElementMap
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to simplify accessibility tree: ${e.message}")
+            return null
+        }
+    }
+
     /**
      * Simplify raw uiautomator XML into a compact text representation.
      * Interactive elements (clickable or focusable) are numbered sequentially (#1, #2, ...)
@@ -2747,14 +3354,10 @@ class AgentEngine(
             var packageName = ""
             var activeText = ""
             var elementNumber = 0
-            val boundsRegex = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
 
-            val nodeRegex = Regex("""<node\s+([^>]+?)/?>\s*""")
-            val attrRegex = Regex("""(\w[\w-]*)="([^"]*?)"""")
-
-            for (nodeMatch in nodeRegex.findAll(xml)) {
+            for (nodeMatch in UI_NODE_REGEX.findAll(xml)) {
                 val attrs = mutableMapOf<String, String>()
-                for (attrMatch in attrRegex.findAll(nodeMatch.groupValues[1])) {
+                for (attrMatch in UI_ATTR_REGEX.findAll(nodeMatch.groupValues[1])) {
                     attrs[attrMatch.groupValues[1]] = attrMatch.groupValues[2]
                 }
 
@@ -2783,48 +3386,76 @@ class AgentEngine(
                 val isInteractive = clickable || focusable
 
                 val shortClass = className.substringAfterLast(".")
-                val parts = mutableListOf<String>()
+                val line = buildString {
+                    if (isInteractive) {
+                        elementNumber++
+                        append("#")
+                        append(elementNumber)
+                        append(' ')
 
-                if (isInteractive) {
-                    elementNumber++
-                    parts.add("#$elementNumber")
-
-                    val boundsMatch = boundsRegex.find(bounds)
-                    if (boundsMatch != null) {
-                        val left = boundsMatch.groupValues[1].toInt()
-                        val top = boundsMatch.groupValues[2].toInt()
-                        val right = boundsMatch.groupValues[3].toInt()
-                        val bottom = boundsMatch.groupValues[4].toInt()
-                        val centerX = (left + right) / 2
-                        val centerY = (top + bottom) / 2
-                        elementMap[elementNumber] = Pair(centerX, centerY)
+                        val boundsMatch = UI_BOUNDS_REGEX.find(bounds)
+                        if (boundsMatch != null) {
+                            val left = boundsMatch.groupValues[1].toInt()
+                            val top = boundsMatch.groupValues[2].toInt()
+                            val right = boundsMatch.groupValues[3].toInt()
+                            val bottom = boundsMatch.groupValues[4].toInt()
+                            val centerX = (left + right) / 2
+                            val centerY = (top + bottom) / 2
+                            elementMap[elementNumber] = Pair(centerX, centerY)
+                        }
+                        deriveStableKeypadToken(
+                            resourceId = resourceId.substringAfterLast("/"),
+                            text = text,
+                            contentDesc = contentDesc
+                        )?.let { token ->
+                            tokenElementMap.putIfAbsent(token, elementNumber)
+                        }
                     }
-                    deriveStableKeypadToken(
-                        resourceId = resourceId.substringAfterLast("/"),
-                        text = text,
-                        contentDesc = contentDesc
-                    )?.let { token ->
-                        tokenElementMap.putIfAbsent(token, elementNumber)
+
+                    append("[")
+                    append(shortClass)
+                    append("]")
+                    if (text.isNotEmpty()) {
+                        append(' ')
+                        append("\"")
+                        append(text.take(50))
+                        append("\"")
+                    }
+                    if (contentDesc.isNotEmpty() && contentDesc != text) {
+                        append(' ')
+                        append("desc=\"")
+                        append(contentDesc.take(40))
+                        append("\"")
+                    }
+                    if (resourceId.isNotEmpty()) {
+                        append(' ')
+                        append("id=")
+                        append(resourceId.substringAfterLast("/"))
+                    }
+
+                    var needsFlagSeparator = true
+                    if (clickable) {
+                        append(' ')
+                        append("clickable")
+                        needsFlagSeparator = false
+                    }
+                    if (focusable) {
+                        append(if (needsFlagSeparator) ' ' else ',')
+                        append("focusable")
+                        needsFlagSeparator = false
+                    }
+                    if (!enabled) {
+                        append(if (needsFlagSeparator) ' ' else ',')
+                        append("disabled")
                     }
                 }
 
-                parts.add("[$shortClass]")
-                if (text.isNotEmpty()) parts.add("\"${text.take(50)}\"")
-                if (contentDesc.isNotEmpty() && contentDesc != text) parts.add("desc=\"${contentDesc.take(40)}\"")
-                if (resourceId.isNotEmpty()) parts.add("id=${resourceId.substringAfterLast("/")}")
-
-                val flags = mutableListOf<String>()
-                if (clickable) flags.add("clickable")
-                if (focusable) flags.add("focusable")
-                if (!enabled) flags.add("disabled")
-                if (flags.isNotEmpty()) parts.add(flags.joinToString(","))
-
-                lines.add(parts.joinToString(" "))
+                lines.add(line)
             }
 
             if (lines.isEmpty()) return null
-            val resultText = if (lines.size > 150) {
-                lines.take(150).joinToString("\n") + "\n... (${lines.size - 150} more nodes)"
+            val resultText = if (lines.size > MAX_UI_TREE_LINES) {
+                lines.take(MAX_UI_TREE_LINES).joinToString("\n") + "\n... (${lines.size - MAX_UI_TREE_LINES} more nodes)"
             } else {
                 lines.joinToString("\n")
             }

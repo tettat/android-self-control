@@ -1,6 +1,8 @@
 package com.control.app.ui.screens
 
 import android.app.Application
+import android.content.Intent
+import android.provider.Settings
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
@@ -64,6 +66,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -71,15 +74,19 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.navigation.NavController
 import com.control.app.ControlApp
 import com.control.app.adb.PairingRelayClient
 import com.control.app.agent.AppSkill
 import com.control.app.data.AppSettings
 import com.control.app.log.ExecutionLogServerStatus
+import com.control.app.service.UiTreeAccessibilityService
 import com.control.app.ui.navigation.Routes
 import com.control.app.ui.theme.StatusColors
 import kotlinx.coroutines.Job
@@ -170,6 +177,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val _isOperating = MutableStateFlow(false)
     val isOperating: StateFlow<Boolean> = _isOperating.asStateFlow()
 
+    private val _accessibilityStatus = MutableStateFlow(AccessibilityStatus())
+    val accessibilityStatus: StateFlow<AccessibilityStatus> = _accessibilityStatus.asStateFlow()
+
     val connectService = app.adbExecutor.mdnsDiscovery.connectService
     val executionLogServerStatus = app.executionLogHttpServer.status
 
@@ -189,8 +199,14 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     init {
         refreshAdbStatus()
+        refreshAccessibilityStatus()
         app.ensureAdbReady()
         loadSkills()
+        viewModelScope.launch {
+            UiTreeAccessibilityService.isConnected.collect {
+                refreshAccessibilityStatus()
+            }
+        }
     }
 
     override fun onCleared() {
@@ -201,6 +217,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun refreshAdbStatus() {
         _adbStatus.value = AdbStatus(isConnected = app.adbExecutor.isConnected())
         app.executionLogHttpServer.refreshStatus()
+    }
+
+    fun refreshAccessibilityStatus() {
+        _accessibilityStatus.value = AccessibilityStatus(
+            isEnabled = UiTreeAccessibilityService.isEnabled(app),
+            isConnected = UiTreeAccessibilityService.isConnected.value
+        )
     }
 
     /**
@@ -456,6 +479,11 @@ data class AdbStatus(
     val isConnected: Boolean = false
 )
 
+data class AccessibilityStatus(
+    val isEnabled: Boolean = false,
+    val isConnected: Boolean = false
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsScreen(
@@ -470,10 +498,24 @@ fun SettingsScreen(
     val relayError by viewModel.relayError.collectAsStateWithLifecycle()
     val currentChannelUrl by viewModel.currentChannelUrl.collectAsStateWithLifecycle()
     val executionLogServerStatus by viewModel.executionLogServerStatus.collectAsStateWithLifecycle()
+    val accessibilityStatus by viewModel.accessibilityStatus.collectAsStateWithLifecycle()
     val skills by viewModel.skills.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
 
     LaunchedEffect(Unit) { viewModel.loadSkills() }
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.refreshAccessibilityStatus()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -623,6 +665,39 @@ fun SettingsScreen(
                         checked = settings.showExecutionOverlay,
                         onCheckedChange = { scope.launch { viewModel.updateShowExecutionOverlay(it) } }
                     )
+                }
+            }
+
+            SectionHeader(title = "无障碍组件树")
+            SettingsCard {
+                Text(
+                    text = if (accessibilityStatus.isEnabled) {
+                        if (accessibilityStatus.isConnected) {
+                            "已启用，组件树将优先走无障碍服务"
+                        } else {
+                            "已启用，等待无障碍服务接管当前窗口"
+                        }
+                    } else {
+                        "未启用，当前仍会回退到 ADB ui_dump"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "开启后会优先读取 rootInActiveWindow，通常比 uiautomator dump 更快。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = {
+                        context.startActivity(
+                            Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                ) {
+                    Text(if (accessibilityStatus.isEnabled) "查看无障碍设置" else "去开启无障碍")
                 }
             }
 
