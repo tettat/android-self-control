@@ -1,6 +1,7 @@
 package com.control.app.agent
 
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -229,28 +230,35 @@ object ToolDefinitions {
 
         add(buildTool(
             name = "tap_region",
-            description = "点击当前视图中某个区域的正中央。屏幕/放大区域被分为9个子区域（1-9，从左到右从上到下：第1行123，第2行456，第3行789）。先用 zoom_region 放大到目标区域，再用此工具精确点击。",
+            description = "点击当前视图中某个区域内的目标点。屏幕/放大区域被分为9个子区域（1-9，从左到右从上到下：第1行123，第2行456，第3行789）。默认点击该区域中心；若目标靠边或靠角，可传 anchor=bottom/right/bottom_right 等指定区域内落点。先用 zoom_region 放大到目标区域，再用此工具精确点击。",
             required = listOf("region"),
             properties = {
                 put("region", buildJsonObject {
                     put("type", "integer")
                     put("description", "要点击的区域编号 1-9")
                 })
+                put("anchor", buildJsonObject {
+                    put("type", "string")
+                    put("description", "区域内落点，默认 center。可选: top_left, top, top_right, left, center, right, bottom_left, bottom, bottom_right")
+                    put("enum", buildJsonArray {
+                        RegionAnchor.apiNames.forEach { add(JsonPrimitive(it)) }
+                    })
+                })
                 put("description", buildJsonObject {
                     put("type", "string")
-                    put("description", "操作说明")
+                    put("description", "操作说明。若目标在区域边缘/角落，请写出方位，例如“点击右下角免拼按钮”")
                 })
             }
         ))
 
         add(buildTool(
             name = "wait",
-            description = "等待指定时间，让页面加载或动画完成。",
+            description = "等待指定时间，让页面加载或动画完成。请按场景自适应选择时长，优先使用够用的最短等待；轻量点击/弹层通常 200-400ms，页面切换通常 400-800ms，只有启动 App 或明显重加载时才建议 1000ms 以上。",
             required = emptyList(),
             properties = {
                 put("duration", buildJsonObject {
                     put("type", "integer")
-                    put("description", "等待时长（毫秒），默认1000")
+                    put("description", "等待时长（毫秒）。建议按场景自适应：轻量 UI 200-400，页面切换 400-800，App 启动/重加载 1000-1800；默认400")
                 })
                 put("description", buildJsonObject {
                     put("type", "string")

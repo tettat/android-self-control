@@ -1,6 +1,8 @@
 package com.control.app.ui.screens
 
 import android.app.Application
+import android.content.Intent
+import android.provider.Settings
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
@@ -19,8 +21,11 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Check
@@ -29,6 +34,7 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
+import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Error
 import androidx.compose.material.icons.outlined.Info
@@ -51,6 +57,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -59,19 +66,29 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.navigation.NavController
 import com.control.app.ControlApp
 import com.control.app.adb.PairingRelayClient
+import com.control.app.agent.AppSkill
 import com.control.app.data.AppSettings
+import com.control.app.log.ExecutionLogServerStatus
+import com.control.app.service.UiTreeAccessibilityService
 import com.control.app.ui.navigation.Routes
 import com.control.app.ui.theme.StatusColors
 import kotlinx.coroutines.Job
@@ -82,10 +99,92 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
+@Composable
+private fun PersistedTextField(
+    value: String,
+    onCommit: (String) -> Unit,
+    label: @Composable () -> Unit,
+    modifier: Modifier = Modifier,
+    placeholder: @Composable (() -> Unit)? = null,
+    singleLine: Boolean = false,
+    visualTransformation: VisualTransformation = VisualTransformation.None,
+    trailingIcon: @Composable (() -> Unit)? = null,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default
+) {
+    var localValue by remember {
+        mutableStateOf(
+            TextFieldValue(
+                text = value,
+                selection = TextRange(value.length)
+            )
+        )
+    }
+    var isEditing by remember { mutableStateOf(false) }
+    var pendingCommit by remember { mutableStateOf<String?>(null) }
+
+    if (pendingCommit == value) {
+        pendingCommit = null
+    } else if (!isEditing && pendingCommit == null && localValue.text != value) {
+        localValue = TextFieldValue(
+            text = value,
+            selection = TextRange(value.length)
+        )
+    }
+
+    fun commitIfChanged() {
+        isEditing = false
+        val committedText = localValue.text
+        if (committedText != value) {
+            pendingCommit = committedText
+            onCommit(committedText)
+        }
+    }
+
+    OutlinedTextField(
+        value = localValue,
+        onValueChange = {
+            isEditing = true
+            pendingCommit = null
+            localValue = it
+        },
+        label = label,
+        placeholder = placeholder,
+        singleLine = singleLine,
+        visualTransformation = visualTransformation,
+        trailingIcon = trailingIcon,
+        keyboardOptions = keyboardOptions.copy(imeAction = ImeAction.Done),
+        keyboardActions = KeyboardActions(onDone = { commitIfChanged() }),
+        modifier = modifier.onFocusChanged { focusState ->
+            if (focusState.isFocused) {
+                isEditing = true
+            } else if (isEditing) {
+                commitIfChanged()
+            }
+        }
+    )
+}
+
 class SettingsViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as ControlApp
 
     val settings = app.settingsStore.settings
+
+    private val _skills = MutableStateFlow<List<AppSkill>>(emptyList())
+    val skills: StateFlow<List<AppSkill>> = _skills.asStateFlow()
+
+    fun loadSkills() {
+        _skills.value = app.skillStore.getAllSkills()
+    }
+
+    fun deleteSkill(packageName: String) {
+        app.skillStore.deleteSkill(packageName)
+        loadSkills()
+    }
+
+    fun clearAllSkills() {
+        app.skillStore.clearAllSkills()
+        loadSkills()
+    }
 
     private val _adbStatus = MutableStateFlow(AdbStatus())
     val adbStatus: StateFlow<AdbStatus> = _adbStatus.asStateFlow()
@@ -96,7 +195,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     private val _isOperating = MutableStateFlow(false)
     val isOperating: StateFlow<Boolean> = _isOperating.asStateFlow()
 
+    private val _accessibilityStatus = MutableStateFlow(AccessibilityStatus())
+    val accessibilityStatus: StateFlow<AccessibilityStatus> = _accessibilityStatus.asStateFlow()
+
     val connectService = app.adbExecutor.mdnsDiscovery.connectService
+    val executionLogServerStatus = app.executionLogHttpServer.status
 
     // Remote pairing relay (created dynamically per session)
     private var relayClient: PairingRelayClient? = null
@@ -114,18 +217,31 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     init {
         refreshAdbStatus()
-        app.adbExecutor.mdnsDiscovery.startDiscovery()
-        tryAutoConnect()
+        refreshAccessibilityStatus()
+        app.ensureAdbReady()
+        loadSkills()
+        viewModelScope.launch {
+            UiTreeAccessibilityService.isConnected.collect {
+                refreshAccessibilityStatus()
+            }
+        }
     }
 
     override fun onCleared() {
         super.onCleared()
         stopRemotePairing()
-        app.adbExecutor.mdnsDiscovery.stopDiscovery()
     }
 
     fun refreshAdbStatus() {
         _adbStatus.value = AdbStatus(isConnected = app.adbExecutor.isConnected())
+        app.executionLogHttpServer.refreshStatus()
+    }
+
+    fun refreshAccessibilityStatus() {
+        _accessibilityStatus.value = AccessibilityStatus(
+            isEnabled = UiTreeAccessibilityService.isEnabled(app),
+            isConnected = UiTreeAccessibilityService.isConnected.value
+        )
     }
 
     /**
@@ -363,6 +479,10 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun refreshLogServerStatus() {
+        app.executionLogHttpServer.refreshStatus()
+    }
+
     suspend fun updateApiEndpoint(value: String) = app.settingsStore.updateApiEndpoint(value)
     suspend fun updateApiKey(value: String) = app.settingsStore.updateApiKey(value)
     suspend fun updateModelName(value: String) = app.settingsStore.updateModelName(value)
@@ -374,6 +494,11 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 }
 
 data class AdbStatus(
+    val isConnected: Boolean = false
+)
+
+data class AccessibilityStatus(
+    val isEnabled: Boolean = false,
     val isConnected: Boolean = false
 )
 
@@ -390,7 +515,25 @@ fun SettingsScreen(
     val isPolling by viewModel.isPolling.collectAsStateWithLifecycle()
     val relayError by viewModel.relayError.collectAsStateWithLifecycle()
     val currentChannelUrl by viewModel.currentChannelUrl.collectAsStateWithLifecycle()
+    val executionLogServerStatus by viewModel.executionLogServerStatus.collectAsStateWithLifecycle()
+    val accessibilityStatus by viewModel.accessibilityStatus.collectAsStateWithLifecycle()
+    val skills by viewModel.skills.collectAsStateWithLifecycle()
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    LaunchedEffect(Unit) { viewModel.loadSkills() }
+    androidx.compose.runtime.DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.refreshAccessibilityStatus()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -430,11 +573,11 @@ fun SettingsScreen(
             // API Configuration
             SectionHeader(title = "API 配置")
             SettingsCard {
-                OutlinedTextField(
+                PersistedTextField(
                     value = settings.apiEndpoint,
-                    onValueChange = { scope.launch { viewModel.updateApiEndpoint(it) } },
+                    onCommit = { scope.launch { viewModel.updateApiEndpoint(it) } },
                     label = { Text("API 端点") },
-                    placeholder = { Text("https://api.openai.com/v1") },
+                    placeholder = { Text("https://coding.dashscope.aliyuncs.com/v1") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -442,9 +585,9 @@ fun SettingsScreen(
                 Spacer(modifier = Modifier.height(12.dp))
 
                 var showApiKey by remember { mutableStateOf(false) }
-                OutlinedTextField(
+                PersistedTextField(
                     value = settings.apiKey,
-                    onValueChange = { scope.launch { viewModel.updateApiKey(it) } },
+                    onCommit = { scope.launch { viewModel.updateApiKey(it) } },
                     label = { Text("API 密钥") },
                     placeholder = { Text("sk-...") },
                     singleLine = true,
@@ -527,11 +670,11 @@ fun SettingsScreen(
                 ) {
                     Column(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = "执行过程展示",
+                            text = "执行过程提示",
                             style = MaterialTheme.typography.bodyLarge
                         )
                         Text(
-                            text = "悬浮球运行时显示执行状态",
+                            text = "自动操作时显示状态条和屏幕边缘光晕",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
@@ -542,6 +685,47 @@ fun SettingsScreen(
                     )
                 }
             }
+
+            SectionHeader(title = "无障碍组件树")
+            SettingsCard {
+                Text(
+                    text = if (accessibilityStatus.isEnabled) {
+                        if (accessibilityStatus.isConnected) {
+                            "已启用，组件树将优先走无障碍服务"
+                        } else {
+                            "已启用，等待无障碍服务接管当前窗口"
+                        }
+                    } else {
+                        "未启用，当前仍会回退到 ADB ui_dump"
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+                Text(
+                    text = "开启后会优先读取 rootInActiveWindow，通常比 uiautomator dump 更快。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                OutlinedButton(
+                    onClick = {
+                        context.startActivity(
+                            Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                ) {
+                    Text(if (accessibilityStatus.isEnabled) "查看无障碍设置" else "去开启无障碍")
+                }
+            }
+
+            // Accumulated skills (persisted by SkillStore)
+            SectionHeader(title = "应用技巧")
+            AccumulatedSkillsCard(
+                skills = skills,
+                onDeleteSkill = { viewModel.deleteSkill(it) },
+                onClearAll = { viewModel.clearAllSkills() }
+            )
 
             // Voice Configuration
             SectionHeader(title = "语音配置")
@@ -617,11 +801,123 @@ fun SettingsScreen(
                 onResetPairing = { viewModel.resetPairing() }
             )
 
+            SectionHeader(title = "日志访问")
+            ExecutionLogAccessCard(
+                serverStatus = executionLogServerStatus,
+                onRefresh = { viewModel.refreshLogServerStatus() }
+            )
+
             // Xiaomi/MIUI Tips
             SectionHeader(title = "使用提示")
             UsageTipsCard()
 
             Spacer(modifier = Modifier.height(32.dp))
+        }
+    }
+}
+
+@Composable
+private fun AccumulatedSkillsCard(
+    skills: List<AppSkill>,
+    onDeleteSkill: (String) -> Unit,
+    onClearAll: () -> Unit
+) {
+    val dateFormat = remember { java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()) }
+
+    SettingsCard {
+        Text(
+            text = "智能体执行任务时积累的应用操作技巧，已持久化保存。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(bottom = 12.dp)
+        )
+        if (skills.isEmpty()) {
+            Text(
+                text = "暂无积累的技巧，完成任务并反思后会在此显示。",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            return@SettingsCard
+        }
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            skills.forEach { skill ->
+                var expanded by remember(skill.packageName) { mutableStateOf(false) }
+                Column {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { expanded = !expanded }
+                            .padding(vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = skill.appName,
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.Medium
+                            )
+                            Text(
+                                text = "${skill.packageName} · ${skill.tips.size} 条技巧",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                text = dateFormat.format(java.util.Date(skill.lastUpdated)),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            IconButton(
+                                onClick = { onDeleteSkill(skill.packageName) },
+                                modifier = Modifier.size(36.dp)
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Outlined.Delete,
+                                    contentDescription = "删除该应用技巧"
+                                )
+                            }
+                            Icon(
+                                imageVector = if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                                contentDescription = if (expanded) "收起" else "展开"
+                            )
+                        }
+                    }
+                    AnimatedVisibility(
+                        visible = expanded,
+                        enter = expandVertically(),
+                        exit = shrinkVertically()
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(start = 8.dp, bottom = 8.dp)
+                                .background(
+                                    MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f),
+                                    RoundedCornerShape(8.dp)
+                                )
+                                .padding(12.dp)
+                        ) {
+                            skill.tips.forEachIndexed { i, tip ->
+                                Text(
+                                    text = "${i + 1}. $tip",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurface,
+                                    modifier = Modifier.padding(vertical = 2.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = onClearAll,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("清空全部技巧")
+            }
         }
     }
 }
@@ -1024,6 +1320,78 @@ private fun AdbConnectionCard(
 }
 
 @Composable
+private fun ExecutionLogAccessCard(
+    serverStatus: ExecutionLogServerStatus,
+    onRefresh: () -> Unit
+) {
+    SettingsCard {
+        StatusRow(
+            label = "日志服务",
+            isOk = serverStatus.isRunning,
+            okText = "已启动",
+            badText = "未启动"
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "同一局域网内优先使用第一个地址访问，即可读取当前手机上的执行日志。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        SelectionContainer {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                serverStatus.accessUrls.forEach { url ->
+                    Text(
+                        text = url,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "浏览器页面: /\nJSON 日志: /api/logs\n会话列表: /api/sessions\n健康检查: /health",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        Text(
+            text = "说明: 这是只读接口，返回当前 App 进程内的执行日志；App 在运行时即可访问。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        serverStatus.errorMessage?.let { message ->
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = message,
+                style = MaterialTheme.typography.bodySmall,
+                color = StatusColors.Error
+            )
+        }
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        OutlinedButton(
+            onClick = onRefresh,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text("刷新日志地址")
+        }
+    }
+}
+
+@Composable
 private fun SectionHeader(title: String) {
     Text(
         text = title,
@@ -1053,7 +1421,12 @@ private fun SettingsCard(content: @Composable () -> Unit) {
 }
 
 @Composable
-private fun StatusRow(label: String, isOk: Boolean) {
+private fun StatusRow(
+    label: String,
+    isOk: Boolean,
+    okText: String = "已连接",
+    badText: String = "未连接"
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.fillMaxWidth()
@@ -1072,7 +1445,7 @@ private fun StatusRow(label: String, isOk: Boolean) {
         )
         Spacer(modifier = Modifier.weight(1f))
         Text(
-            text = if (isOk) "已连接" else "未连接",
+            text = if (isOk) okText else badText,
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Medium,
             color = if (isOk) StatusColors.Success else StatusColors.Error

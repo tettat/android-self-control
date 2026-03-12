@@ -17,6 +17,8 @@ out/
 
 # Gradle files
 .gradle/
+.gradle-user-home/
+.android-sdk/
 build/
 
 # Local configuration file (sdk path, etc)
@@ -54,6 +56,7 @@ secrets.properties
 
 # Local deploy script (contains server credentials)
 deploy.local.sh
+server/relay.log
 
 # OS generated files
 .DS_Store

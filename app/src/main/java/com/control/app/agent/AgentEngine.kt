@@ -1,22 +1,39 @@
 package com.control.app.agent
 
+import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import android.hardware.display.DisplayManager
+import android.os.Handler
+import android.os.Looper
 import android.util.Base64
+import android.util.DisplayMetrics
 import android.util.Log
+import android.view.Display
+import android.widget.Toast
 import com.control.app.adb.AdbExecutor
 import com.control.app.ai.OpenAIClient
 import com.control.app.data.AppSettings
 import com.control.app.data.SettingsStore
+import com.control.app.log.ExecutionLogFormatter
 import com.control.app.prompt.DefaultPrompts
 import com.control.app.prompt.PromptManager
+import com.control.app.service.FloatingBubbleService
+import com.control.app.service.UiTreeAccessibilityService
+import com.control.app.util.ImageMemoryUtils
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -26,16 +43,23 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
-import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.random.Random
 
 class AgentEngine(
+    appContext: Context,
     private val adbExecutor: AdbExecutor,
     private val openAIClient: OpenAIClient,
     private val promptManager: PromptManager,
@@ -47,12 +71,83 @@ class AgentEngine(
     companion object {
         private const val TAG = "AgentEngine"
         private const val ACTION_SETTLE_DELAY_MS = 500L
+        private const val WAIT_DEFAULT_DURATION_MS = 400
+        private const val WAIT_MIN_DURATION_MS = 150
+        private const val WAIT_MAX_DURATION_MS = 5_000
+        private const val MODEL_IMAGE_DETAIL_DEFAULT = "low"
+        private const val MODEL_IMAGE_DETAIL_ZOOM = "high"
+        private const val MODEL_IMAGE_JPEG_QUALITY = 52
+        private const val MODEL_ZOOM_IMAGE_JPEG_QUALITY = 64
+        private const val CALCULATOR_APP_FOREGROUND_TIMEOUT_MS = 2_000L
+        private const val CALCULATOR_APP_FOREGROUND_POLL_MS = 150L
+        private const val CALCULATOR_UI_STABILIZE_DELAY_MS = 800L
+        private const val CALCULATOR_FAST_PATH_TAP_DELAY_MS = 90L
+        private const val CALCULATOR_UI_RETRY_DELAY_MS = 250L
+        private const val CALCULATOR_UI_MAX_ATTEMPTS = 3
+        private const val TAP_SEQUENCE_DEFAULT_INTERVAL_MS = 80
+        private const val TAP_SEQUENCE_MAX_INTERVAL_MS = 250
+        private const val TAP_SEQUENCE_MAX_ELEMENTS = 12
+        private const val TAP_SEQUENCE_SETTLE_DELAY_MS = 150L
+        private const val TOOL_TAP_CUE_HOLD_MS = 1_000L
+        private const val TOOL_TAP_CUE_FADE_MS = 550L
+        private const val TOOL_SWIPE_CUE_HOLD_MS = 1_050L
+        private const val TOOL_SWIPE_CUE_FADE_MS = 600L
+        private const val TOOL_SEQUENCE_CUE_HOLD_MS = 1_100L
+        private const val TOOL_SEQUENCE_CUE_FADE_MS = 650L
+        private const val SWIPE_PATH_INTERMEDIATE_POINTS = 2
+        private const val SWIPE_PATH_MAX_OFFSET_PX = 36f
+        private const val UI_DUMP_FAILURES_BEFORE_COOLDOWN = 2
+        private const val UI_DUMP_COOLDOWN_CAPTURES = 5
+        private const val MAX_UI_TREE_LINES = 150
+        private const val MAX_DEBUG_LOG_ENTRIES = 120
+        private const val MAX_DEBUG_LOG_IMAGE_ENTRIES = 24
+        private const val MAX_DEBUG_LOG_IMAGES_PER_ENTRY = 2
+        private const val DEBUG_LOG_IMAGE_MAX_LONG_EDGE = 1280
+        private const val DEBUG_LOG_IMAGE_JPEG_QUALITY = 72
+        private val UI_BOUNDS_REGEX = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+        private val UI_NODE_REGEX = Regex("""<node\s+([^>]+?)/?>\s*""")
+        private val UI_ATTR_REGEX = Regex("""(\w[\w-]*)="([^"]*?)"""")
         /** Compress history when message count exceeds this threshold. */
         private const val MAX_MESSAGES_BEFORE_COMPRESSION = 30
         /** Number of recent messages to keep verbatim during compression. */
         private const val KEEP_RECENT_COUNT = 8
         /** Minimum number of middle messages to justify a compression call. */
         private const val MIN_MESSAGES_TO_COMPRESS = 5
+        private val STABLE_KEYPAD_APP_ALIASES = listOf(
+            StableKeypadTarget(
+                aliases = listOf("计算器", "calculator", "calc"),
+                foregroundPackages = listOf("com.miui.calculator", "com.android.calculator2")
+            ),
+            StableKeypadTarget(
+                aliases = listOf("电话", "拨号", "拨打", "通话", "phone", "dialer", "tel"),
+                foregroundPackages = listOf(
+                    "com.android.contacts",
+                    "com.qti.phone",
+                    "com.android.dialer",
+                    "com.android.phone"
+                ),
+                launchCommand = "am start -a android.intent.action.DIAL"
+            )
+        )
+        private val MIUI_CALCULATOR_KEYPAD = mapOf(
+            "C" to NormalizedPoint(0.1685f, 0.5417f),
+            "/" to NormalizedPoint(0.8306f, 0.5417f),
+            "7" to NormalizedPoint(0.1685f, 0.6333f),
+            "8" to NormalizedPoint(0.3889f, 0.6333f),
+            "9" to NormalizedPoint(0.6093f, 0.6333f),
+            "*" to NormalizedPoint(0.8306f, 0.6333f),
+            "4" to NormalizedPoint(0.1685f, 0.7252f),
+            "5" to NormalizedPoint(0.3889f, 0.7252f),
+            "6" to NormalizedPoint(0.6093f, 0.7252f),
+            "-" to NormalizedPoint(0.8306f, 0.7252f),
+            "1" to NormalizedPoint(0.1685f, 0.8173f),
+            "2" to NormalizedPoint(0.3889f, 0.8173f),
+            "3" to NormalizedPoint(0.6093f, 0.8173f),
+            "+" to NormalizedPoint(0.8306f, 0.8173f),
+            "0" to NormalizedPoint(0.3889f, 0.9094f),
+            "." to NormalizedPoint(0.6093f, 0.9094f),
+            "=" to NormalizedPoint(0.8306f, 0.9094f)
+        )
     }
 
     private val _debugLog = MutableStateFlow<List<DebugLogEntry>>(emptyList())
@@ -64,6 +159,9 @@ class AgentEngine(
     private val _overlayVisible = MutableStateFlow(true)
     val overlayVisible: StateFlow<Boolean> = _overlayVisible.asStateFlow()
 
+    private val appContext = appContext.applicationContext
+    private val mainHandler = Handler(Looper.getMainLooper())
+
     private var currentJob: Job? = null
 
     /** Maps element number (#N) to center (x, y) coordinates for the current screenshot. */
@@ -71,6 +169,10 @@ class AgentEngine(
 
     /** Scale factor used for the current screenshot, for coordinate conversion. */
     private var currentScreenshotScale: Float = 1.0f
+
+    /** Last screenshot size in pixels (model input size, before scaling to screen). */
+    private var lastScreenshotWidth: Int = 0
+    private var lastScreenshotHeight: Int = 0
 
     /** Most recent screenshot base64 for tap annotation overlay. */
     private var lastScreenshotBase64: String? = null
@@ -82,22 +184,192 @@ class AgentEngine(
      */
     private var currentZoomRect: android.graphics.RectF? = null
 
+    /** How many upcoming captures should skip uiautomator dump after repeated failures. */
+    private var uiDumpCooldownRemaining = 0
+
+    /** Count consecutive uiautomator dump failures within the current task. */
+    private var uiDumpFailureStreak = 0
+
+    private fun setProgress(
+        currentRound: Int = _agentState.value.currentRound,
+        statusMessage: String = _agentState.value.statusMessage,
+        activeTool: String = _agentState.value.activeTool,
+        lastThinking: String = _agentState.value.lastThinking,
+        lastAction: String = _agentState.value.lastAction,
+        toolArguments: String = _agentState.value.currentToolArguments,
+        stepIntent: String = _agentState.value.currentStepIntent,
+        phaseTiming: TimingBreakdown? = null
+    ) {
+        val prev = _agentState.value
+        val now = System.currentTimeMillis()
+        val statusChanged = statusMessage != prev.statusMessage
+        _agentState.value = prev.copy(
+            currentRound = currentRound,
+            statusMessage = statusMessage,
+            activeTool = activeTool,
+            lastThinking = lastThinking,
+            lastAction = lastAction,
+            currentToolArguments = toolArguments,
+            currentStepIntent = stepIntent,
+            phaseStartedAtMs = if (statusChanged) now else prev.phaseStartedAtMs,
+            stepTimings = if (statusChanged) finalizeCurrentStep(prev, now) else prev.stepTimings,
+            currentPhaseTiming = when {
+                statusChanged -> phaseTiming ?: TimingBreakdown()
+                phaseTiming != null -> prev.currentPhaseTiming.merge(phaseTiming)
+                else -> prev.currentPhaseTiming
+            },
+            lastProgressAtMs = now
+        )
+    }
+
+    private fun finalizeCurrentStep(state: AgentState, endTimeMs: Long): List<StepTiming> {
+        if (state.phaseStartedAtMs <= 0L || state.statusMessage.isBlank()) {
+            return state.stepTimings
+        }
+
+        val durationMs = (endTimeMs - state.phaseStartedAtMs).coerceAtLeast(0L)
+        val previous = state.stepTimings.lastOrNull()
+        if (previous != null &&
+            previous.label == state.statusMessage &&
+            previous.startedAtMs == state.phaseStartedAtMs
+        ) {
+            return state.stepTimings
+        }
+
+        return state.stepTimings + StepTiming(
+            label = state.statusMessage,
+            tool = state.activeTool,
+            toolArguments = state.currentToolArguments,
+            intent = state.currentStepIntent,
+            startedAtMs = state.phaseStartedAtMs,
+            finishedAtMs = endTimeMs,
+            durationMs = durationMs,
+            breakdown = state.currentPhaseTiming
+        )
+    }
+
+    private fun buildStepTimingSummary(stepTimings: List<StepTiming>): String {
+        if (stepTimings.isEmpty()) return "无步骤耗时记录"
+        return buildString {
+            stepTimings.forEachIndexed { index, step ->
+                append(ExecutionLogFormatter.formatStepTimingLine(index, step))
+                if (index != stepTimings.lastIndex) {
+                    append('\n')
+                }
+            }
+        }
+    }
+
+    private fun formatDurationMs(durationMs: Long): String {
+        val safe = durationMs.coerceAtLeast(0L)
+        return if (safe < 1_000L) {
+            "${safe}ms"
+        } else {
+            val totalSeconds = safe / 1000
+            val minutes = totalSeconds / 60
+            val seconds = totalSeconds % 60
+            if (minutes > 0) "${minutes}m${seconds}s" else "${seconds}s"
+        }
+    }
+
+    private fun formatTimingBreakdown(breakdown: TimingBreakdown): String {
+        return ExecutionLogFormatter.formatTimingBreakdown(breakdown)
+    }
+
     fun addLog(entry: DebugLogEntry) {
-        _debugLog.value = _debugLog.value + entry
-        sessionManager.addEntryToCurrentSession(entry)
+        val normalizedEntry = normalizeDebugLogEntry(entry)
+        _debugLog.value = trimDebugLogEntries(_debugLog.value + normalizedEntry)
+        sessionManager.addEntryToCurrentSession(normalizedEntry)
     }
 
     fun clearLogs() {
         _debugLog.value = emptyList()
     }
 
-    suspend fun executeCommand(voiceCommand: String): String = coroutineScope {
+    private fun normalizeDebugLogEntry(entry: DebugLogEntry): DebugLogEntry {
+        val sourceImages = if (entry.images.isNotEmpty()) {
+            entry.images
+        } else {
+            entry.imageBase64?.let { listOf(DebugLogImage(base64 = it, mimeType = entry.imageMimeType)) }
+                ?: emptyList()
+        }
+        if (sourceImages.isEmpty()) return entry.withoutImages()
+
+        val normalizedImages = sourceImages
+            .take(MAX_DEBUG_LOG_IMAGES_PER_ENTRY)
+            .map(::normalizeDebugLogImage)
+
+        return entry.withImages(normalizedImages)
+    }
+
+    private fun normalizeDebugLogImage(image: DebugLogImage): DebugLogImage {
+        val transcoded = runCatching {
+            ImageMemoryUtils.transcodeBase64Image(
+                base64 = image.base64,
+                maxLongEdge = DEBUG_LOG_IMAGE_MAX_LONG_EDGE,
+                quality = DEBUG_LOG_IMAGE_JPEG_QUALITY
+            )
+        }.getOrNull() ?: return image
+
+        return if (transcoded.base64.length < image.base64.length) {
+            DebugLogImage(
+                base64 = transcoded.base64,
+                mimeType = transcoded.mimeType
+            )
+        } else {
+            image
+        }
+    }
+
+    private fun trimDebugLogEntries(entries: List<DebugLogEntry>): List<DebugLogEntry> {
+        val trimmed = entries.takeLast(MAX_DEBUG_LOG_ENTRIES).toMutableList()
+        var imageEntriesKept = 0
+        for (index in trimmed.lastIndex downTo 0) {
+            val entry = trimmed[index]
+            if (entry.images.isEmpty()) continue
+
+            if (imageEntriesKept < MAX_DEBUG_LOG_IMAGE_ENTRIES) {
+                imageEntriesKept++
+            } else {
+                trimmed[index] = entry.withoutImages()
+            }
+        }
+        return trimmed
+    }
+
+    private fun showTaskCompletionToast(message: String) {
+        val singleLineMessage = message
+            .lineSequence()
+            .map { it.trim() }
+            .firstOrNull { it.isNotEmpty() }
+            ?: "任务完成"
+        val toastMessage = "任务结束: ${singleLineMessage.take(80)}" +
+            if (singleLineMessage.length > 80) "..." else ""
+
+        mainHandler.post {
+            Toast.makeText(appContext, toastMessage, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    suspend fun executeCommand(
+        voiceCommand: String,
+        inputTitle: String = "语音指令"
+    ): String = coroutineScope {
         val settings = settingsStore.settings.first()
+
+        if (settings.apiEndpoint.isBlank()) {
+            val errorMsg = "API 端点未配置，请先在设置中填写"
+            addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "配置错误", content = errorMsg))
+            _agentState.value = AgentState(statusMessage = errorMsg)
+            showTaskCompletionToast(errorMsg)
+            return@coroutineScope errorMsg
+        }
 
         if (settings.apiKey.isBlank()) {
             val errorMsg = "API Key 未配置，请先在设置中填写"
             addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "配置错误", content = errorMsg))
             _agentState.value = AgentState(statusMessage = errorMsg)
+            showTaskCompletionToast(errorMsg)
             return@coroutineScope errorMsg
         }
 
@@ -105,23 +377,32 @@ class AgentEngine(
             val errorMsg = "ADB 未连接，请先在设置中连接无线调试"
             addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "ADB 错误", content = errorMsg))
             _agentState.value = AgentState(statusMessage = errorMsg)
+            showTaskCompletionToast(errorMsg)
             return@coroutineScope errorMsg
         }
 
         // Create a new session for this task
         val session = sessionManager.createSession(voiceCommand)
+        val startTime = System.currentTimeMillis()
+        var finalStepTimings: List<StepTiming> = emptyList()
+
+        resetCaptureStateForNewTask()
 
         _agentState.value = AgentState(
             isRunning = true,
             currentRound = 0,
             maxRounds = settings.maxRounds,
-            statusMessage = "正在执行: $voiceCommand"
+            statusMessage = "正在执行: $voiceCommand",
+            lastAction = "收到指令",
+            taskStartedAtMs = startTime,
+            phaseStartedAtMs = startTime,
+            lastProgressAtMs = startTime
         )
 
         addLog(
             DebugLogEntry(
                 type = DebugLogType.VOICE_INPUT,
-                title = "语音指令",
+                title = inputTitle,
                 content = voiceCommand
             )
         )
@@ -130,8 +411,11 @@ class AgentEngine(
         val messageHistory = session.messageHistory
         var resultMessage = "任务完成"
         var step = 0
+        var fastPathHandled = false
+        val stableKeypadPlan = parseStableKeypadPlan(voiceCommand)
 
         try {
+            if (!fastPathHandled) {
             // System message
             val systemPrompt = promptManager.getPrompt(DefaultPrompts.PROMPT_KEY_SYSTEM)
             messageHistory.add(buildJsonObject {
@@ -140,30 +424,91 @@ class AgentEngine(
             })
 
             // Take initial screenshot + UI tree
-            _agentState.value = _agentState.value.copy(
-                statusMessage = "正在截图..."
+            setProgress(
+                statusMessage = "正在截图...",
+                activeTool = "",
+                lastAction = "准备初始截图与界面树",
+                stepIntent = "准备初始截图与界面树"
             )
 
-            val (imageBase64, screenshotWidth, screenshotHeight, uiTree) = captureScreen(settings.screenshotScale)
+            val initialCapture = captureScreen(settings.screenshotScale)
+            setProgress(phaseTiming = initialCapture.timing)
+
+            var effectiveCapture = initialCapture
+            if (stableKeypadPlan != null &&
+                !hasStableKeypadCoverage(stableKeypadPlan, initialCapture.uiTreeResult)
+            ) {
+                retryStableKeypadCapture(stableKeypadPlan, settings.screenshotScale)?.let { retryCapture ->
+                    effectiveCapture = retryCapture
+                }
+            }
+
+            val imageBase64 = effectiveCapture.imageBase64
+            val screenshotWidth = effectiveCapture.screenshotWidth
+            val screenshotHeight = effectiveCapture.screenshotHeight
+            val uiTree = effectiveCapture.uiTree
+            val uiTreeResult = effectiveCapture.uiTreeResult
 
             val gridImage = drawZoneGrid(imageBase64)
+            val initialCaptureTimingSummary = formatTimingBreakdown(initialCapture.timing)
 
             addLog(
                 DebugLogEntry(
                     type = DebugLogType.SCREENSHOT,
                     title = "初始截图",
-                    content = "截图: ${screenshotWidth}x${screenshotHeight}" +
-                        if (uiTree != null) ", ${currentElementMap.size}个可交互元素" else ", 控件树不可用",
+                    content = buildString {
+                        append("截图: ${screenshotWidth}x${screenshotHeight}")
+                        append(if (uiTree != null) ", ${currentElementMap.size}个可交互元素" else ", 控件树不可用")
+                        if (initialCaptureTimingSummary.isNotBlank()) {
+                            appendLine()
+                            append("耗时拆分: $initialCaptureTimingSummary")
+                        }
+                    },
                     imageBase64 = gridImage
                 )
             )
 
-            // Build initial user message with screenshot + task
+            if (stableKeypadPlan != null && uiTreeResult != null) {
+                tryExecuteStableKeypadFromUi(
+                    plan = stableKeypadPlan,
+                    uiTreeResult = uiTreeResult,
+                    verificationMode = StableKeypadVerificationMode.NONE
+                )?.let { fastPathResult ->
+                    resultMessage = fastPathResult
+                    fastPathHandled = true
+                }
+            }
+
+            if (fastPathHandled) {
+                showTaskCompletionToast(resultMessage)
+                val currentState = _agentState.value
+                finalStepTimings = finalizeCurrentStep(currentState, System.currentTimeMillis())
+                _agentState.value = currentState.copy(
+                    isRunning = false,
+                    statusMessage = resultMessage,
+                    lastAction = resultMessage,
+                    stepTimings = finalStepTimings,
+                    currentPhaseTiming = TimingBreakdown()
+                )
+                sessionManager.endCurrentSession(resultMessage)
+                addLog(
+                    DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "任务结束",
+                        content = "结果: $resultMessage\n总步数: 0\n总耗时: ${formatDurationMs(System.currentTimeMillis() - startTime)}\n\n步骤耗时:\n${buildStepTimingSummary(finalStepTimings)}"
+                    )
+                )
+                return@coroutineScope resultMessage
+            }
+
+            // Build initial user message with screenshot + task（注入已保存技巧名称供模型选择加载）
+            val skillNames = skillStore?.getAllSkills()?.map { "${it.appName} (${it.packageName})" } ?: emptyList()
             val actionPrompt = promptManager.buildActionPrompt(
                 userCommand = voiceCommand,
                 screenshotWidth = screenshotWidth,
                 screenshotHeight = screenshotHeight,
-                uiTree = uiTree
+                uiTree = uiTree,
+                skillNames = skillNames
             )
 
             val userMessage = buildUserMessageWithImage(actionPrompt, gridImage)
@@ -172,24 +517,23 @@ class AgentEngine(
             // Main tool-calling loop
             while (step < settings.maxRounds) {
                 step++
-                _agentState.value = _agentState.value.copy(
+                setProgress(
                     currentRound = step,
-                    statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在调用AI..."
+                    statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在调用AI...",
+                    activeTool = "",
+                    lastAction = "等待 AI 决策",
+                    stepIntent = "调用模型生成下一步动作"
                 )
 
                 Log.d(TAG, "=== Step $step/${settings.maxRounds} ===")
 
-                // Log API request
-                val messageRoles = messageHistory.map { msg ->
-                    (msg["role"] as? JsonPrimitive)?.content ?: "unknown"
-                }
                 addLog(
                     DebugLogEntry(
                         type = DebugLogType.API_REQUEST,
                         title = "API 请求 (第${step}步)",
                         content = buildString {
+                            appendLine("准备发送 AI 请求")
                             appendLine("History messages: ${messageHistory.size}")
-                            appendLine("Message roles: ${messageRoles.joinToString(" -> ")}")
                             appendLine("Tools: ${ToolDefinitions.AGENT_TOOLS.size} defined")
                         }
                     )
@@ -201,15 +545,40 @@ class AgentEngine(
                     tools = ToolDefinitions.AGENT_TOOLS,
                     apiEndpoint = settings.apiEndpoint,
                     apiKey = settings.apiKey,
-                    modelName = settings.modelName
+                    modelName = settings.modelName,
+                    logHttp = { httpLog ->
+                        addLog(
+                            DebugLogEntry(
+                                type = if (httpLog.title.contains("响应")) {
+                                    DebugLogType.API_RESPONSE
+                                } else {
+                                    DebugLogType.API_REQUEST
+                                },
+                                title = "${httpLog.title} (第${step}步)",
+                                content = httpLog.content,
+                                imageBase64 = httpLog.imageBase64,
+                                imageMimeType = httpLog.imageMimeType,
+                                images = httpLog.images
+                            )
+                        )
+                    }
                 )
 
-                val result = apiResult.getOrElse { e ->
+                val apiCall = apiResult.getOrElse { e ->
                     val errMsg = "API 调用失败: ${e.message}"
                     addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "API 错误", content = errMsg))
                     Log.e(TAG, errMsg, e)
                     throw RuntimeException(errMsg, e)
                 }
+                val apiTiming = TimingBreakdown(
+                    uploadMs = apiCall.timing.uploadMs,
+                    modelMs = apiCall.timing.modelMs
+                )
+                val apiTimingSummary = formatTimingBreakdown(apiTiming)
+                setProgress(
+                    phaseTiming = apiTiming
+                )
+                val result = apiCall.result
 
                 when (result) {
                     is AIChatResult.TextResponse -> {
@@ -220,14 +589,21 @@ class AgentEngine(
                             DebugLogEntry(
                                 type = DebugLogType.API_RESPONSE,
                                 title = "AI 文本响应 (第${step}步)",
-                                content = result.content
+                                content = buildString {
+                                    append(result.content)
+                                    if (apiTimingSummary.isNotBlank()) {
+                                        appendLine()
+                                        append("耗时拆分: $apiTimingSummary")
+                                    }
+                                }
                             )
                         )
 
-                        _agentState.value = _agentState.value.copy(
-                            lastThinking = result.content.take(200)
+                        setProgress(
+                            lastThinking = result.content.take(200),
+                            activeTool = "",
+                            lastAction = "AI 返回了最终文本响应"
                         )
-
                         resultMessage = result.content.ifBlank { "任务完成" }
                         break
                     }
@@ -236,15 +612,19 @@ class AgentEngine(
                         // Add assistant's message (with tool_calls) to history
                         messageHistory.add(result.rawMessage)
 
-                        val toolNames = result.toolCalls.map { it.functionName }
+                        val toolCalls = result.toolCalls
+                        val toolNames = toolCalls.map { it.functionName }
                         addLog(
                             DebugLogEntry(
                                 type = DebugLogType.API_RESPONSE,
                                 title = "AI 工具调用 (第${step}步)",
                                 content = buildString {
                                     appendLine("工具调用: ${toolNames.joinToString(", ")}")
-                                    for (tc in result.toolCalls) {
+                                    for (tc in toolCalls) {
                                         appendLine("  ${tc.functionName}(${tc.arguments})")
+                                    }
+                                    if (apiTimingSummary.isNotBlank()) {
+                                        append("耗时拆分: $apiTimingSummary")
                                     }
                                 }
                             )
@@ -252,8 +632,13 @@ class AgentEngine(
 
                         Log.d(TAG, "AI requested tools: $toolNames")
 
-                        _agentState.value = _agentState.value.copy(
-                            statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolNames.first()}..."
+                        val stepIntentFromAssistant = extractTextContent(result.rawMessage).trim().take(400)
+
+                        setProgress(
+                            statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolNames.firstOrNull().orEmpty()}...",
+                            activeTool = toolNames.firstOrNull().orEmpty(),
+                            lastAction = "AI 规划了 ${toolNames.size} 个动作，本轮顺序执行",
+                            stepIntent = stepIntentFromAssistant
                         )
 
                         var taskCompleted = false
@@ -261,11 +646,20 @@ class AgentEngine(
                         var zoomImageOverride: String? = null
 
                         // Execute each tool call and add results to history
-                        for (toolCall in result.toolCalls) {
+                        for (toolCall in toolCalls) {
+                            var toolStartedAt = 0L
                             try {
+                                setProgress(
+                                    statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在执行 ${toolCall.functionName}...",
+                                    activeTool = toolCall.functionName,
+                                    lastAction = "开始执行 ${toolCall.functionName}",
+                                    toolArguments = formatToolArguments(toolCall.arguments),
+                                    stepIntent = stepIntentFromAssistant
+                                )
+
                                 // Hide overlay before interactive actions
                                 val isInteractive = toolCall.functionName in listOf(
-                                    "tap", "tap_element", "input_element", "swipe",
+                                    "tap", "tap_element", "tap_element_sequence", "input_element", "swipe",
                                     "input_text", "scroll_down", "scroll_up", "adb_shell",
                                     "launch_app", "press_back", "press_home", "key_event",
                                     "tap_region"
@@ -275,7 +669,9 @@ class AgentEngine(
                                     delay(50)
                                 }
 
+                                toolStartedAt = System.currentTimeMillis()
                                 val toolResult = executeToolCall(toolCall)
+                                val toolMs = (System.currentTimeMillis() - toolStartedAt).coerceAtLeast(0L)
 
                                 if (isInteractive) {
                                     _overlayVisible.value = true
@@ -291,11 +687,17 @@ class AgentEngine(
                                         content = buildString {
                                             appendLine("参数: ${toolCall.arguments}")
                                             appendLine("结果: ${toolResult.take(200)}")
+                                            append("耗时拆分: tool_ms=${toolMs}ms")
                                         }
                                     )
                                 )
 
                                 Log.d(TAG, "Tool ${toolCall.functionName} done: ${toolResult.take(80)}")
+                                setProgress(
+                                    activeTool = toolCall.functionName,
+                                    lastAction = "${toolCall.functionName}: ${toolResult.take(80)}",
+                                    phaseTiming = TimingBreakdown(toolMs = toolMs)
+                                )
 
                                 // Check if this was the "complete" tool
                                 if (toolCall.functionName == "complete") {
@@ -313,12 +715,17 @@ class AgentEngine(
 
                                 // Wait for UI to settle after interactive actions
                                 if (isInteractive) {
-                                    delay(ACTION_SETTLE_DELAY_MS)
+                                    delay(settleDelayForTool(toolCall.functionName))
                                 }
                             } catch (e: CancellationException) {
                                 throw e
                             } catch (e: Exception) {
                                 _overlayVisible.value = true
+                                val toolMs = if (toolStartedAt > 0L) {
+                                    (System.currentTimeMillis() - toolStartedAt).coerceAtLeast(0L)
+                                } else {
+                                    0L
+                                }
 
                                 val errMsg = "工具执行失败 [${toolCall.functionName}]: ${e.message}"
                                 messageHistory.add(buildToolResultMessage(toolCall.id, "ERROR: $errMsg"))
@@ -327,10 +734,26 @@ class AgentEngine(
                                     DebugLogEntry(
                                         type = DebugLogType.ERROR,
                                         title = "工具失败: ${toolCall.functionName}",
-                                        content = errMsg
+                                        content = if (toolMs > 0L) {
+                                            "$errMsg\n耗时拆分: tool_ms=${toolMs}ms"
+                                        } else {
+                                            errMsg
+                                        }
                                     )
                                 )
                                 Log.e(TAG, errMsg, e)
+                                setProgress(
+                                    activeTool = toolCall.functionName,
+                                    lastAction = errMsg.take(120),
+                                    phaseTiming = TimingBreakdown(toolMs = toolMs)
+                                )
+                                setProgress(
+                                    statusMessage = "第 ${step}/${settings.maxRounds} 步: ${toolCall.functionName} 失败",
+                                    activeTool = toolCall.functionName,
+                                    lastAction = errMsg.take(120),
+                                    toolArguments = formatToolArguments(toolCall.arguments),
+                                    stepIntent = stepIntentFromAssistant
+                                )
                             }
                         }
 
@@ -339,47 +762,83 @@ class AgentEngine(
                             break
                         }
 
-                        // Strip images from all previous user messages to save tokens
-                        stripImagesFromHistory(messageHistory)
+                        val shouldCaptureFreshScreen = shouldCaptureAfterToolCalls(
+                            toolCalls
+                        )
+                        if (zoomImageOverride != null || shouldCaptureFreshScreen) {
+                            stripImagesFromHistory(messageHistory)
+                        }
 
                         if (zoomImageOverride != null) {
                             // zoom_region was called: send the zoomed image instead of taking a new screenshot
                             val zoomMsg = buildUserMessageWithImage(
-                                "已放大到指定区域，请查看上图。继续选择子区域放大(zoom_region)或点击(tap_region)。区域编号: 第1行123，第2行456，第3行789。",
-                                zoomImageOverride!!
+                                "已放大到指定区域，请查看上图。继续选择子区域放大(zoom_region)或点击(tap_region)。若目标靠边/靠角，可在 tap_region 里加 anchor=bottom/right/bottom_right 等。区域编号: 第1行123，第2行456，第3行789。",
+                                zoomImageOverride!!,
+                                detail = MODEL_IMAGE_DETAIL_ZOOM
                             )
                             messageHistory.add(zoomMsg)
-                        } else {
+                        } else if (shouldCaptureFreshScreen) {
                             // Reset zoom state for fresh screenshot
                             currentZoomRect = null
 
                             // After executing tool calls, take a fresh screenshot and append as user message
                             // This gives the AI up-to-date visual context for its next decision
-                            _agentState.value = _agentState.value.copy(
-                                statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在截图..."
+                            setProgress(
+                                statusMessage = "第 ${step}/${settings.maxRounds} 步: 正在截图...",
+                                activeTool = "",
+                                lastAction = "动作执行完成，刷新界面",
+                                stepIntent = "动作执行完成，刷新界面"
                             )
 
-                            val (newImageBase64, newWidth, newHeight, newUiTree) = captureScreen(settings.screenshotScale)
+                            val followUpCapture = captureScreen(settings.screenshotScale)
+                            setProgress(phaseTiming = followUpCapture.timing)
+
+                            val newImageBase64 = followUpCapture.imageBase64
+                            val newWidth = followUpCapture.screenshotWidth
+                            val newHeight = followUpCapture.screenshotHeight
+                            val newUiTree = followUpCapture.uiTree
                             val gridFollowUp = drawZoneGrid(newImageBase64)
+                            val followUpTimingSummary = formatTimingBreakdown(followUpCapture.timing)
 
                             addLog(
                                 DebugLogEntry(
                                     type = DebugLogType.SCREENSHOT,
                                     title = "截图 (第${step}步后)",
-                                    content = "截图: ${newWidth}x${newHeight}" +
-                                        if (newUiTree != null) ", ${currentElementMap.size}个可交互元素" else ", 控件树不可用",
+                                    content = buildString {
+                                        append("截图: ${newWidth}x${newHeight}")
+                                        append(if (newUiTree != null) ", ${currentElementMap.size}个可交互元素" else ", 控件树不可用")
+                                        if (followUpTimingSummary.isNotBlank()) {
+                                            appendLine()
+                                            append("耗时拆分: $followUpTimingSummary")
+                                        }
+                                    },
                                     imageBase64 = gridFollowUp
                                 )
                             )
 
+                            val followUpSkillNames = skillStore?.getAllSkills()?.map { "${it.appName} (${it.packageName})" } ?: emptyList()
                             val followUpPrompt = promptManager.buildFollowUpPrompt(
                                 screenshotWidth = newWidth,
                                 screenshotHeight = newHeight,
-                                uiTree = newUiTree
+                                uiTree = newUiTree,
+                                skillNames = followUpSkillNames
                             )
 
                             val followUpMessage = buildUserMessageWithImage(followUpPrompt, gridFollowUp)
                             messageHistory.add(followUpMessage)
+                        } else {
+                            addLog(
+                                DebugLogEntry(
+                                    type = DebugLogType.INFO,
+                                    title = "跳过截图",
+                                    content = "刚才执行的工具不会直接改变界面，复用上一张截图继续推理"
+                                )
+                            )
+                            messageHistory.add(
+                                buildTextOnlyUserMessage(
+                                    "没有新的屏幕截图。刚才执行的工具不会直接改变界面，请结合最近一次截图和最新工具结果继续。"
+                                )
+                            )
                         }
 
                         // Compress conversation history if it has grown too long
@@ -390,6 +849,7 @@ class AgentEngine(
 
             if (step >= settings.maxRounds && resultMessage == "任务完成") {
                 resultMessage = "已达到最大步数限制 (${settings.maxRounds})，任务可能未完成"
+            }
             }
 
         } catch (e: CancellationException) {
@@ -408,23 +868,40 @@ class AgentEngine(
             Log.e(TAG, "Task failed", e)
         } finally {
             _overlayVisible.value = true
+            val finishTime = System.currentTimeMillis()
+            finalStepTimings = finalizeCurrentStep(_agentState.value, finishTime)
             _agentState.value = AgentState(
                 isRunning = false,
                 currentRound = step,
                 maxRounds = settings.maxRounds,
-                statusMessage = resultMessage
+                statusMessage = resultMessage,
+                lastAction = resultMessage,
+                taskStartedAtMs = startTime,
+                phaseStartedAtMs = finishTime,
+                lastProgressAtMs = finishTime,
+                stepTimings = finalStepTimings
+            )
+            addLog(
+                DebugLogEntry(
+                    type = DebugLogType.INFO,
+                    title = "任务结束",
+                    content = buildString {
+                        appendLine("结果: $resultMessage")
+                        appendLine("总步数: $step")
+                        append("总耗时: ${formatDurationMs(finishTime - startTime)}")
+                        if (finalStepTimings.isNotEmpty()) {
+                            appendLine()
+                            appendLine()
+                            appendLine("步骤耗时:")
+                            append(buildStepTimingSummary(finalStepTimings))
+                        }
+                    }
+                )
             )
             // Mark session as ended
             sessionManager.endCurrentSession(resultMessage)
+            showTaskCompletionToast(resultMessage)
         }
-
-        addLog(
-            DebugLogEntry(
-                type = DebugLogType.INFO,
-                title = "任务结束",
-                content = "结果: $resultMessage\n总步数: $step"
-            )
-        )
 
         resultMessage
     }
@@ -539,6 +1016,15 @@ class AgentEngine(
         Log.d(TAG, "History compressed: $originalSize -> ${messageHistory.size} messages")
     }
 
+    /** Format tool call arguments for step timing log (compact one-line). */
+    private fun formatToolArguments(args: JsonObject): String {
+        if (args.isEmpty()) return ""
+        return args.entries.joinToString(", ") { (k, v) ->
+            val vStr = (v as? JsonPrimitive)?.content ?: v.toString()
+            "$k=${vStr.take(80)}"
+        }.take(400)
+    }
+
     /**
      * Extract text content from a message, handling both plain-string and content-array formats.
      */
@@ -556,6 +1042,615 @@ class AgentEngine(
         }
     }
 
+    private data class CalculatorUiSnapshot(
+        val expression: String,
+        val result: String,
+        val buttonCenters: Map<String, Pair<Int, Int>>
+    )
+
+    private data class NormalizedPoint(
+        val xFraction: Float,
+        val yFraction: Float
+    )
+
+    private suspend fun tryExecuteStableKeypadFromUi(
+        plan: StableKeypadPlan,
+        uiTreeResult: UiTreeResult,
+        verificationMode: StableKeypadVerificationMode
+    ): String? {
+        if (uiTreeResult.tokenElementMap.isEmpty()) return null
+        if (!plan.sequence.all { token -> uiTreeResult.tokenElementMap.containsKey(token.toString()) }) {
+            return null
+        }
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.INFO,
+                title = "快速路径命中",
+                content = "基于当前 UI 树识别到稳定键盘，尝试本地批量输入: ${plan.sequence}"
+            )
+        )
+
+        val sequenceAlreadyVisible = uiTreeResult.activeText.contains(plan.sequence) ||
+            uiTreeResult.visibleTexts.any { it.contains(plan.sequence) }
+        val canClearExistingInput = canClearStableKeypadInput(uiTreeResult)
+        if (sequenceAlreadyVisible && !canClearExistingInput) {
+            return "任务完成：当前界面已显示 ${plan.sequence}"
+        }
+
+        if (canClearExistingInput) {
+            maybeClearStableKeypadInput(uiTreeResult)
+        }
+
+        val tapStartedAt = System.currentTimeMillis()
+        plan.sequence.forEachIndexed { index, ch ->
+            val elementId = uiTreeResult.tokenElementMap[ch.toString()]
+                ?: throw IllegalStateException("当前 UI 树中缺少键位 '$ch'")
+            val (x, y) = uiTreeResult.elementMap[elementId]
+                ?: throw IllegalStateException("键位 '$ch' 缺少坐标")
+            adbExecutor.tap(x, y).getOrThrow()
+            if (index != plan.sequence.lastIndex) {
+                delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            }
+        }
+        delay(CALCULATOR_UI_RETRY_DELAY_MS)
+
+        setProgress(
+            statusMessage = "快速路径: 已输入表达式",
+            activeTool = "stable_keypad_fast_path",
+            lastAction = "已基于当前 UI 树本地输入 ${plan.sequence}",
+            toolArguments = buildStableKeypadToolArguments(plan, uiTreeResult.packageName),
+            stepIntent = "在稳定键盘界面直接批量点击整串按键，避免进入模型回合",
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - tapStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        val verifiedTree = when (verificationMode) {
+            StableKeypadVerificationMode.UI_DUMP -> dumpStableKeypadUiTreeWithRetry()
+            StableKeypadVerificationMode.NONE -> null
+        }
+        val verified = verifiedTree != null &&
+            (verifiedTree.activeText.contains(plan.sequence) ||
+                verifiedTree.visibleTexts.any { it.contains(plan.sequence) })
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.ACTION_EXECUTED,
+                title = "执行: stable_keypad_fast_path",
+                content = buildString {
+                    appendLine("package=${verifiedTree?.packageName ?: uiTreeResult.packageName}")
+                    appendLine("sequence=${plan.sequence}")
+                    append("verified=${if (verified) "true" else "best-effort"}")
+                }
+            )
+        )
+
+        return if (verified) {
+            "任务完成：已通过稳定键盘快速输入 ${plan.sequence}"
+        } else {
+            "任务完成：已触发稳定键盘快速输入 ${plan.sequence}"
+        }
+    }
+
+    private fun hasStableKeypadCoverage(
+        plan: StableKeypadPlan,
+        uiTreeResult: UiTreeResult?
+    ): Boolean {
+        if (uiTreeResult == null) return false
+        return plan.sequence.all { token -> uiTreeResult.tokenElementMap.containsKey(token.toString()) }
+    }
+
+    private suspend fun dumpStableKeypadUiTreeWithRetry(
+        plan: StableKeypadPlan? = null
+    ): UiTreeResult? {
+        var lastTree: UiTreeResult? = null
+        repeat(CALCULATOR_UI_MAX_ATTEMPTS) { attempt ->
+            val tree = captureUiTreeResultFromBestAvailableSource(ignoreCooldown = true)
+            if (tree != null) {
+                lastTree = tree
+                if (plan == null || hasStableKeypadCoverage(plan, tree)) {
+                    return tree
+                }
+            }
+            if (attempt != CALCULATOR_UI_MAX_ATTEMPTS - 1) {
+                delay(CALCULATOR_UI_RETRY_DELAY_MS)
+            }
+        }
+        return lastTree
+    }
+
+    private suspend fun retryStableKeypadCapture(
+        plan: StableKeypadPlan,
+        screenshotScale: Float
+    ): ScreenCapture? {
+        repeat(2) { attempt ->
+            delay(350L)
+            val retryCapture = runCatching { captureScreen(screenshotScale) }.getOrNull() ?: return@repeat
+            if (hasStableKeypadCoverage(plan, retryCapture.uiTreeResult)) {
+                addLog(
+                    DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "快速路径重试",
+                        content = "第 ${attempt + 1} 次补充抓屏后识别到完整稳定键盘，继续尝试本地批量输入"
+                    )
+                )
+                return retryCapture
+            }
+        }
+        return null
+    }
+
+    private data class StableKeypadPlan(
+        val foregroundPackages: List<String>,
+        val sequence: String,
+        val launchCommand: String? = null
+    )
+
+    private data class StableKeypadTarget(
+        val aliases: List<String>,
+        val foregroundPackages: List<String>,
+        val launchCommand: String? = null
+    )
+
+    private enum class StableKeypadVerificationMode {
+        UI_DUMP,
+        NONE
+    }
+
+    private fun parseStableKeypadPlan(command: String): StableKeypadPlan? {
+        val lower = command.lowercase(Locale.ROOT)
+        val explicitSequence = Regex("""(?:输入|键入|拨打|拨号|input|dial)\s*([0-9+\-*/xX×÷.=#]+)""")
+            .find(command)
+            ?.groupValues
+            ?.getOrNull(1)
+        val fallbackSequence = Regex("""[0-9+\-*/xX×÷.=#]{3,}""")
+            .findAll(command)
+            .map { it.value }
+            .firstOrNull()
+        val normalizedSequence = (explicitSequence ?: fallbackSequence)
+            ?.replace(" ", "")
+            ?.replace("×", "*")
+            ?.replace("x", "*")
+            ?.replace("X", "*")
+            ?.replace("÷", "/")
+            ?: return null
+        if (!normalizedSequence.all { it.isDigit() || it in setOf('+', '-', '*', '/', '.', '#', '=') }) {
+            return null
+        }
+
+        val matchedTarget = STABLE_KEYPAD_APP_ALIASES.firstOrNull { target ->
+            target.aliases.any { alias -> command.contains(alias) || lower.contains(alias) }
+        }
+
+        val inferredTarget = matchedTarget ?: if (normalizedSequence.any { it in setOf('+', '-', '*', '/', '.', '=') }) {
+            StableKeypadTarget(
+                aliases = emptyList(),
+                foregroundPackages = listOf("com.miui.calculator", "com.android.calculator2")
+            )
+        } else {
+            null
+        }
+
+        return StableKeypadPlan(
+            foregroundPackages = inferredTarget?.foregroundPackages.orEmpty().distinct(),
+            sequence = normalizedSequence,
+            launchCommand = inferredTarget?.launchCommand
+        )
+    }
+
+    private fun canClearStableKeypadInput(uiTreeResult: UiTreeResult): Boolean {
+        return uiTreeResult.tokenElementMap.containsKey("CLEAR") ||
+            uiTreeResult.tokenElementMap.containsKey("BACKSPACE")
+    }
+
+    private fun buildStableKeypadToolArguments(
+        plan: StableKeypadPlan,
+        activePackage: String? = null
+    ): String {
+        return buildString {
+            append("sequence=${plan.sequence}")
+            if (plan.foregroundPackages.isNotEmpty()) {
+                append(", packages=${plan.foregroundPackages.joinToString()}")
+            }
+            if (!plan.launchCommand.isNullOrBlank()) {
+                append(", launch=${plan.launchCommand}")
+            }
+            if (!activePackage.isNullOrBlank()) {
+                append(", package=$activePackage")
+            }
+        }
+    }
+
+    private suspend fun maybeClearStableKeypadInput(uiTreeResult: UiTreeResult) {
+        val currentValue = uiTreeResult.activeText.trim()
+        if (currentValue.isBlank() || currentValue == "0") return
+
+        uiTreeResult.tokenElementMap["CLEAR"]?.let { elementId ->
+            val (x, y) = uiTreeResult.elementMap[elementId] ?: return
+            adbExecutor.tap(x, y).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            return
+        }
+
+        val backspaceId = uiTreeResult.tokenElementMap["BACKSPACE"] ?: return
+        val (x, y) = uiTreeResult.elementMap[backspaceId] ?: return
+        repeat(currentValue.length.coerceAtMost(20)) {
+            adbExecutor.tap(x, y).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+        }
+    }
+
+    private fun deriveStableKeypadToken(
+        resourceId: String,
+        text: String,
+        contentDesc: String
+    ): String? {
+        val raw = text.ifBlank { contentDesc }
+        return when {
+            resourceId.startsWith("digit_") -> resourceId.removePrefix("digit_")
+            resourceId == "one" || raw.startsWith("一") -> "1"
+            resourceId == "two" || raw.startsWith("二") -> "2"
+            resourceId == "three" || raw.startsWith("三") -> "3"
+            resourceId == "four" || raw.startsWith("四") -> "4"
+            resourceId == "five" || raw.startsWith("五") -> "5"
+            resourceId == "six" || raw.startsWith("六") -> "6"
+            resourceId == "seven" || raw.startsWith("七") -> "7"
+            resourceId == "eight" || raw.startsWith("八") -> "8"
+            resourceId == "nine" || raw.startsWith("九") -> "9"
+            resourceId == "zero" || raw.startsWith("零") -> "0"
+            resourceId == "star" -> "*"
+            resourceId == "pound" -> "#"
+            resourceId == "op_add" || contentDesc == "加" -> "+"
+            resourceId == "op_sub" || contentDesc == "减" -> "-"
+            resourceId == "op_mul" || contentDesc == "乘" -> "*"
+            resourceId == "op_div" || contentDesc == "除" -> "/"
+            resourceId == "dec_point" || contentDesc == "小数点" || raw == "." -> "."
+            resourceId.contains("equal") || contentDesc == "等于" || raw == "=" -> "="
+            resourceId == "btn_c_s" || contentDesc == "清除" || raw == "清除" -> "CLEAR"
+            resourceId.contains("del") || resourceId.contains("delete") ||
+                contentDesc.contains("退格") || contentDesc.contains("删除") -> "BACKSPACE"
+            raw.length == 1 && raw[0].isDigit() -> raw
+            raw in setOf("+", "-", "*", "/", ".", "#", "=") -> raw
+            else -> null
+        }
+    }
+
+    private fun parseCalculatorExpressionCommand(command: String): String? {
+        if (!command.contains("计算器")) return null
+
+        val expressionCandidate = Regex("""[0-9+\-*/xX×÷.= ]+""")
+            .findAll(command)
+            .map { it.value.trim() }
+            .firstOrNull { candidate ->
+                candidate.length >= 3 && candidate.any { it.isDigit() }
+            } ?: return null
+
+        val normalized = expressionCandidate
+            .replace(" ", "")
+            .replace("×", "*")
+            .replace("x", "*")
+            .replace("X", "*")
+            .replace("÷", "/")
+        if (normalized.isBlank()) return null
+        if (!normalized.all { it.isDigit() || it in setOf('+', '-', '*', '/', '.', '=') }) {
+            return null
+        }
+        return normalized
+    }
+
+    private suspend fun executeCalculatorFastPath(expression: String): String {
+        val launchPackages = listOf("com.miui.calculator", "com.android.calculator2")
+        val launchStartedAt = System.currentTimeMillis()
+        setProgress(
+            statusMessage = "快速路径: 正在启动计算器",
+            activeTool = "calculator_fast_path",
+            lastAction = "识别到计算器表达式任务，尝试直连快速执行",
+            toolArguments = "expression=$expression",
+            stepIntent = "直接启动计算器并输入表达式"
+        )
+
+        val requestedPackage = launchPackages.firstOrNull { pkg ->
+            adbExecutor.launchApp(pkg).isSuccess
+        } ?: throw IllegalStateException("无法启动可用的计算器应用")
+        setProgress(
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - launchStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        val launchedPackage = waitForForegroundPackage(
+            packages = launchPackages.toSet(),
+            timeoutMs = CALCULATOR_APP_FOREGROUND_TIMEOUT_MS
+        ) ?: throw IllegalStateException(
+            "计算器未进入前台，启动目标 $requestedPackage，当前前台 ${currentForegroundPackage().ifBlank { "unknown" }}"
+        )
+        delay(CALCULATOR_UI_STABILIZE_DELAY_MS)
+
+        if (launchedPackage == "com.miui.calculator") {
+            return executeMiuiCalculatorFastPath(expression, launchedPackage)
+        }
+
+        val initialSnapshot = dumpCalculatorUiSnapshotWithRetry()
+        if (initialSnapshot.expression == expression || initialSnapshot.result.contains(expression)) {
+            addLog(
+                DebugLogEntry(
+                    type = DebugLogType.INFO,
+                    title = "快速路径命中",
+                    content = "计算器已显示目标表达式，无需重复输入: $expression"
+                )
+            )
+            return "任务完成：计算器已显示 $expression"
+        }
+
+        if (initialSnapshot.expression.isNotBlank() && initialSnapshot.expression != "0") {
+            val clearButton = initialSnapshot.buttonCenters["C"]
+                ?: throw IllegalStateException("找不到计算器清除按钮")
+            val clearStartedAt = System.currentTimeMillis()
+            adbExecutor.tap(clearButton.first, clearButton.second).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            setProgress(
+                statusMessage = "快速路径: 清空旧算式",
+                activeTool = "calculator_fast_path",
+                lastAction = "已点击清除按钮",
+                toolArguments = "expression=$expression",
+                stepIntent = "先清空旧算式，避免错误追加",
+                phaseTiming = TimingBreakdown(
+                    toolMs = (System.currentTimeMillis() - clearStartedAt).coerceAtLeast(0L)
+                )
+            )
+        }
+
+        val refreshedSnapshot = dumpCalculatorUiSnapshotWithRetry()
+        val tapStartedAt = System.currentTimeMillis()
+        expression.forEachIndexed { index, ch ->
+            val token = calculatorTokenForChar(ch)
+            val coords = refreshedSnapshot.buttonCenters[token]
+                ?: throw IllegalStateException("找不到计算器按键 '$ch' 对应的控件")
+            adbExecutor.tap(coords.first, coords.second).getOrThrow()
+            if (index != expression.lastIndex) {
+                delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            }
+        }
+        setProgress(
+            statusMessage = "快速路径: 已输入表达式",
+            activeTool = "calculator_fast_path",
+            lastAction = "已直接输入 $expression",
+            toolArguments = "expression=$expression, package=$launchedPackage",
+            stepIntent = "批量输入计算器表达式",
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - tapStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        delay(250)
+        val finalSnapshot = dumpCalculatorUiSnapshotWithRetry()
+        if (finalSnapshot.expression != expression && !finalSnapshot.result.contains(expression)) {
+            throw IllegalStateException(
+                "表达式校验失败，当前显示 '${finalSnapshot.expression}'，结果 '${finalSnapshot.result}'"
+            )
+        }
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.ACTION_EXECUTED,
+                title = "执行: calculator_fast_path",
+                content = "package=$launchedPackage\nexpression=$expression\nresult=${finalSnapshot.result.ifBlank { "(empty)" }}"
+            )
+        )
+
+        return if (finalSnapshot.result.isNotBlank()) {
+            "任务完成：计算器已输入 $expression，当前结果 ${finalSnapshot.result}"
+        } else {
+            "任务完成：计算器已输入 $expression"
+        }
+    }
+
+    private suspend fun executeMiuiCalculatorFastPath(
+        expression: String,
+        packageName: String
+    ): String {
+        val (screenWidth, screenHeight) = getPhysicalDisplaySize()
+
+        // MIUI calculator keypad is stable on this device family. Clear once, then tap the
+        // expression directly using normalized keypad coordinates to avoid repeated UI dumps.
+        miuiCalculatorPointForToken("C", screenWidth, screenHeight)?.let { (x, y) ->
+            adbExecutor.tap(x, y).getOrThrow()
+            delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+        }
+
+        val tapStartedAt = System.currentTimeMillis()
+        expression.forEachIndexed { index, ch ->
+            val token = calculatorTokenForChar(ch)
+            val coords = miuiCalculatorPointForToken(token, screenWidth, screenHeight)
+                ?: throw IllegalStateException("找不到 MIUI 计算器按键 '$ch' 的坐标")
+            adbExecutor.tap(coords.first, coords.second).getOrThrow()
+            if (index != expression.lastIndex) {
+                delay(CALCULATOR_FAST_PATH_TAP_DELAY_MS)
+            }
+        }
+        setProgress(
+            statusMessage = "快速路径: 已输入表达式",
+            activeTool = "calculator_fast_path",
+            lastAction = "已直接输入 $expression",
+            toolArguments = "expression=$expression, package=$packageName",
+            stepIntent = "按稳定键位批量输入计算器表达式",
+            phaseTiming = TimingBreakdown(
+                toolMs = (System.currentTimeMillis() - tapStartedAt).coerceAtLeast(0L)
+            )
+        )
+
+        delay(200)
+        val verifiedSnapshot = runCatching { dumpCalculatorUiSnapshotWithRetry() }.getOrNull()
+        if (verifiedSnapshot != null &&
+            verifiedSnapshot.expression.isNotBlank() &&
+            verifiedSnapshot.expression != expression
+        ) {
+            throw IllegalStateException(
+                "MIUI 计算器表达式校验失败，当前显示 '${verifiedSnapshot.expression}'"
+            )
+        }
+
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.ACTION_EXECUTED,
+                title = "执行: calculator_fast_path",
+                content = buildString {
+                    appendLine("package=$packageName")
+                    appendLine("expression=$expression")
+                    append("result=${verifiedSnapshot?.result?.ifBlank { "(unverified)" } ?: "(unverified)"}")
+                }
+            )
+        )
+
+        return if (!verifiedSnapshot?.result.isNullOrBlank()) {
+            "任务完成：计算器已输入 $expression，当前结果 ${verifiedSnapshot?.result}"
+        } else {
+            "任务完成：计算器已输入 $expression"
+        }
+    }
+
+    private suspend fun dumpCalculatorUiSnapshot(): CalculatorUiSnapshot {
+        val rawXml = adbExecutor.dumpUiHierarchy().getOrThrow()
+        return parseCalculatorUiSnapshot(rawXml)
+            ?: throw IllegalStateException("无法解析计算器界面")
+    }
+
+    private suspend fun dumpCalculatorUiSnapshotWithRetry(): CalculatorUiSnapshot {
+        var lastError: Throwable? = null
+        repeat(CALCULATOR_UI_MAX_ATTEMPTS) { attempt ->
+            try {
+                return dumpCalculatorUiSnapshot()
+            } catch (error: Throwable) {
+                lastError = error
+                if (attempt != CALCULATOR_UI_MAX_ATTEMPTS - 1) {
+                    delay(CALCULATOR_UI_RETRY_DELAY_MS)
+                }
+            }
+        }
+        throw IllegalStateException(
+            "计算器快速路径抓取界面失败，已重试 $CALCULATOR_UI_MAX_ATTEMPTS 次",
+            lastError
+        )
+    }
+
+    private suspend fun currentForegroundPackage(): String {
+        val output = adbExecutor.executeCommand(
+            "dumpsys activity activities | grep -E 'topResumedActivity|mResumedActivity'"
+        ).getOrThrow()
+        val pkgRegex = Regex("""(\w+(?:\.\w+)+)/""")
+        return pkgRegex.find(output)?.groupValues?.get(1).orEmpty()
+    }
+
+    private suspend fun waitForForegroundPackage(
+        packages: Set<String>,
+        timeoutMs: Long
+    ): String? {
+        val startedAt = System.currentTimeMillis()
+        while (System.currentTimeMillis() - startedAt <= timeoutMs) {
+            val foreground = runCatching { currentForegroundPackage() }.getOrDefault("")
+            if (foreground in packages) {
+                return foreground
+            }
+            delay(CALCULATOR_APP_FOREGROUND_POLL_MS)
+        }
+        return null
+    }
+
+    private fun miuiCalculatorPointForToken(
+        token: String,
+        screenWidth: Int,
+        screenHeight: Int
+    ): Pair<Int, Int>? {
+        val point = MIUI_CALCULATOR_KEYPAD[token] ?: return null
+        return Pair(
+            (screenWidth * point.xFraction).toInt(),
+            (screenHeight * point.yFraction).toInt()
+        )
+    }
+
+    private fun getPhysicalDisplaySize(): Pair<Int, Int> {
+        val displayManager = appContext.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+        val display = displayManager?.getDisplay(Display.DEFAULT_DISPLAY)
+        if (display != null) {
+            val metrics = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            display.getRealMetrics(metrics)
+            if (metrics.widthPixels > 0 && metrics.heightPixels > 0) {
+                return Pair(metrics.widthPixels, metrics.heightPixels)
+            }
+            val mode = display.mode
+            if (mode != null && mode.physicalWidth > 0 && mode.physicalHeight > 0) {
+                return Pair(mode.physicalWidth, mode.physicalHeight)
+            }
+        }
+        val fallback = appContext.resources.displayMetrics
+        return Pair(fallback.widthPixels, fallback.heightPixels)
+    }
+
+    private fun parseCalculatorUiSnapshot(xml: String): CalculatorUiSnapshot? {
+        val boundsRegex = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
+        val nodeRegex = Regex("""<node\s+([^>]+?)/?>\s*""")
+        val attrRegex = Regex("""(\w[\w-]*)="([^"]*?)"""")
+
+        var expression = ""
+        var result = ""
+        val buttonCenters = mutableMapOf<String, Pair<Int, Int>>()
+
+        for (nodeMatch in nodeRegex.findAll(xml)) {
+            val attrs = mutableMapOf<String, String>()
+            for (attrMatch in attrRegex.findAll(nodeMatch.groupValues[1])) {
+                attrs[attrMatch.groupValues[1]] = attrMatch.groupValues[2]
+            }
+
+            val resourceId = (attrs["resource-id"] ?: "").substringAfterLast("/")
+            val text = attrs["text"] ?: ""
+            val contentDesc = attrs["content-desc"] ?: ""
+            val bounds = attrs["bounds"] ?: ""
+            val boundsMatch = boundsRegex.find(bounds) ?: continue
+            val left = boundsMatch.groupValues[1].toInt()
+            val top = boundsMatch.groupValues[2].toInt()
+            val right = boundsMatch.groupValues[3].toInt()
+            val bottom = boundsMatch.groupValues[4].toInt()
+            val center = Pair((left + right) / 2, (top + bottom) / 2)
+
+            when (resourceId) {
+                "expression" -> expression = text
+                "result" -> result = text
+            }
+
+            val token = when {
+                resourceId == "btn_c_s" || contentDesc == "清除" -> "C"
+                resourceId == "op_add" || contentDesc == "加" -> "+"
+                resourceId == "op_sub" || contentDesc == "减" -> "-"
+                resourceId == "op_mul" || contentDesc == "乘" -> "*"
+                resourceId == "op_div" || contentDesc == "除" -> "/"
+                resourceId == "dec_point" || text == "." || contentDesc == "小数点" -> "."
+                resourceId == "btn_equal_s" || contentDesc == "等于" -> "="
+                resourceId.startsWith("digit_") -> resourceId.removePrefix("digit_")
+                text.length == 1 && text[0].isDigit() -> text
+                else -> null
+            }
+
+            if (token != null) {
+                buttonCenters[token] = center
+            }
+        }
+
+        if (buttonCenters.isEmpty()) return null
+        return CalculatorUiSnapshot(
+            expression = expression,
+            result = result,
+            buttonCenters = buttonCenters
+        )
+    }
+
+    private fun calculatorTokenForChar(ch: Char): String = when (ch) {
+        in '0'..'9' -> ch.toString()
+        '+', '-', '*', '/', '.', '=' -> ch.toString()
+        else -> throw IllegalArgumentException("不支持的计算器字符: $ch")
+    }
+
     /**
      * Capture screenshot and UI tree. Returns a data class with all needed info.
      * Handles overlay hiding/showing and coordinate scaling.
@@ -564,7 +1659,9 @@ class AgentEngine(
         val imageBase64: String,
         val screenshotWidth: Int,
         val screenshotHeight: Int,
-        val uiTree: String?
+        val uiTree: String?,
+        val uiTreeResult: UiTreeResult?,
+        val timing: TimingBreakdown
     )
 
     private suspend fun captureScreen(screenshotScale: Float): ScreenCapture {
@@ -572,18 +1669,38 @@ class AgentEngine(
         _overlayVisible.value = false
         delay(150)
 
-        // Take screenshot
-        val screenshotResult = adbExecutor.takeScreenshot(screenshotScale)
-
-        // Dump UI hierarchy while overlay is still hidden
+        // Run screenshot and UI dump in parallel to reduce total capture time
         currentElementMap = emptyMap()
-        val uiTreeResult = try {
-            val rawXml = adbExecutor.dumpUiHierarchy().getOrNull()
-            if (rawXml != null) simplifyUiTree(rawXml) else null
-        } catch (e: Exception) {
-            Log.w(TAG, "UI tree dump failed: ${e.message}")
-            null
+
+        data class ParallelCaptureResult(
+            val screenshotResult: Result<Bitmap>,
+            val uiTreeResult: UiTreeResult?,
+            val screenshotMs: Long,
+            val uiDumpMs: Long
+        )
+        data class ScreenshotTimed(val result: Result<Bitmap>, val ms: Long)
+        data class UiDumpTimed(val tree: UiTreeResult?, val ms: Long)
+
+        val parallelResult = coroutineScope {
+            val screenshotDeferred = async {
+                val t0 = System.currentTimeMillis()
+                val r = adbExecutor.takeScreenshot(screenshotScale)
+                ScreenshotTimed(r, (System.currentTimeMillis() - t0).coerceAtLeast(0L))
+            }
+            val uiDumpDeferred = async {
+                val t0 = System.currentTimeMillis()
+                val tree = captureUiTreeResultFromBestAvailableSource()
+                UiDumpTimed(tree, (System.currentTimeMillis() - t0).coerceAtLeast(0L))
+            }
+            val scr = screenshotDeferred.await()
+            val dump = uiDumpDeferred.await()
+            ParallelCaptureResult(scr.result, dump.tree, scr.ms, dump.ms)
         }
+
+        val screenshotResult = parallelResult.screenshotResult
+        val uiTreeResult = parallelResult.uiTreeResult
+        val screenshotMs = parallelResult.screenshotMs
+        val uiDumpMs = parallelResult.uiDumpMs
         val uiTree = uiTreeResult?.text
         if (uiTreeResult != null) {
             currentElementMap = uiTreeResult.elementMap
@@ -601,24 +1718,293 @@ class AgentEngine(
             } else {
                 "截图失败: ${e.message}"
             }
-            addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "截图错误", content = errMsg))
-            Log.e(TAG, errMsg, e)
-            throw RuntimeException(errMsg, e)
+
+            if (uiTreeResult != null) {
+                addLog(
+                    DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "截图降级",
+                        content = "$errMsg\n已回退为 UI 树占位图，继续执行。"
+                    )
+                )
+                Log.w(TAG, "$errMsg; falling back to UI-tree placeholder", e)
+                buildUiTreePlaceholderBitmap(uiTreeResult, screenshotScale)
+            } else {
+                addLog(DebugLogEntry(type = DebugLogType.ERROR, title = "截图错误", content = errMsg))
+                Log.e(TAG, errMsg, e)
+                throw RuntimeException(errMsg, e)
+            }
         }
 
         // Encode screenshot to base64
+        val encodeStartedAt = System.currentTimeMillis()
         val imageBase64 = bitmapToBase64(screenshot)
+        val encodeMs = (System.currentTimeMillis() - encodeStartedAt).coerceAtLeast(0L)
         val screenshotWidth = screenshot.width
         val screenshotHeight = screenshot.height
         screenshot.recycle()
 
         // Update scale factor for coordinate conversion
         currentScreenshotScale = screenshotScale
+        lastScreenshotWidth = screenshotWidth
+        lastScreenshotHeight = screenshotHeight
 
         // Save for tap annotation overlay
         lastScreenshotBase64 = imageBase64
 
-        return ScreenCapture(imageBase64, screenshotWidth, screenshotHeight, uiTree)
+        return ScreenCapture(
+            imageBase64 = imageBase64,
+            screenshotWidth = screenshotWidth,
+            screenshotHeight = screenshotHeight,
+            uiTree = uiTree,
+            uiTreeResult = uiTreeResult,
+            timing = TimingBreakdown(
+                screenshotMs = screenshotMs,
+                uiDumpMs = uiDumpMs,
+                encodeMs = encodeMs
+            )
+        )
+    }
+
+    private suspend fun captureUiTreeResultFromBestAvailableSource(
+        ignoreCooldown: Boolean = false
+    ): UiTreeResult? {
+        captureAccessibilityUiTree()?.let { tree ->
+            if (isSufficientUiTreeResult(tree)) {
+                uiDumpFailureStreak = 0
+                return tree
+            }
+            Log.w(
+                TAG,
+                "Accessibility UI tree looked incomplete, falling back to uiautomator dump " +
+                    "(elements=${tree.elementMap.size}, texts=${tree.visibleTexts.size}, lines=${tree.text.lineSequence().count { it.isNotBlank() }})"
+            )
+        }
+
+        if (!ignoreCooldown && uiDumpCooldownRemaining > 0) {
+            uiDumpCooldownRemaining--
+            Log.d(TAG, "Skipping UI dump due to cooldown, remaining=$uiDumpCooldownRemaining")
+            return null
+        }
+
+        return try {
+            adbExecutor.dumpUiHierarchy().fold(
+                onSuccess = { rawXml ->
+                    if (rawXml.isBlank()) {
+                        registerUiDumpFailure("uiautomator dump returned empty XML")
+                        null
+                    } else {
+                        uiDumpFailureStreak = 0
+                        withContext(Dispatchers.Default) { simplifyUiTree(rawXml) }
+                    }
+                },
+                onFailure = { error ->
+                    registerUiDumpFailure(error.message ?: "unknown error")
+                    Log.w(TAG, "UI tree dump failed: ${error.message}")
+                    null
+                }
+            )
+        } catch (e: Exception) {
+            registerUiDumpFailure(e.message ?: "unknown error")
+            Log.w(TAG, "UI tree dump failed: ${e.message}")
+            null
+        }
+    }
+
+    private suspend fun captureAccessibilityUiTree(): UiTreeResult? {
+        val snapshot = withContext(Dispatchers.Main.immediate) {
+            UiTreeAccessibilityService.captureSnapshot()
+        } ?: return null
+        return simplifyAccessibilityTree(snapshot)
+    }
+
+    private fun isSufficientUiTreeResult(tree: UiTreeResult): Boolean {
+        if (tree.elementMap.isNotEmpty()) return true
+
+        val nonBlankLineCount = tree.text.lineSequence().count { it.isNotBlank() }
+        return nonBlankLineCount >= 8 || tree.visibleTexts.size >= 5
+    }
+
+    private fun buildUiTreePlaceholderBitmap(
+        uiTreeResult: UiTreeResult,
+        screenshotScale: Float
+    ): Bitmap {
+        val safeScale = screenshotScale.takeIf { it > 0f } ?: 0.5f
+        val width = if (lastScreenshotWidth > 0) {
+            lastScreenshotWidth
+        } else {
+            (1080 * safeScale).roundToInt().coerceAtLeast(360)
+        }
+        val height = if (lastScreenshotHeight > 0) {
+            lastScreenshotHeight
+        } else {
+            (2400 * safeScale).roundToInt().coerceAtLeast(640)
+        }
+
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(Color.rgb(18, 18, 18))
+
+        val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE
+            textSize = 30f
+            typeface = android.graphics.Typeface.DEFAULT_BOLD
+        }
+        val bodyPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(235, 230, 230, 230)
+            textSize = 20f
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        val hintPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.argb(220, 129, 199, 132)
+            textSize = 22f
+        }
+
+        var y = 48f
+        canvas.drawText("Screenshot unavailable", 24f, y, titlePaint)
+        y += 34f
+        canvas.drawText("Using UI tree fallback for this screen.", 24f, y, hintPaint)
+        y += 38f
+        canvas.drawText("package=${uiTreeResult.packageName}", 24f, y, bodyPaint)
+        y += 28f
+        if (uiTreeResult.activeText.isNotBlank()) {
+            canvas.drawText("active=${uiTreeResult.activeText.take(60)}", 24f, y, bodyPaint)
+            y += 28f
+        }
+        y += 8f
+
+        val maxTextWidth = width - 48f
+        val maxLines = ((height - y - 24f) / 26f).toInt().coerceAtLeast(1)
+        val flattenedLines = uiTreeResult.text.lines().filter { it.isNotBlank() }
+        val renderedLines = mutableListOf<String>()
+        for (line in flattenedLines) {
+            if (renderedLines.size >= maxLines) break
+            val chunks = wrapTextForWidth(line, bodyPaint, maxTextWidth)
+            for (chunk in chunks) {
+                if (renderedLines.size >= maxLines) break
+                renderedLines += chunk
+            }
+        }
+
+        renderedLines.forEach { line ->
+            canvas.drawText(line, 24f, y, bodyPaint)
+            y += 26f
+        }
+        if (flattenedLines.size > renderedLines.size) {
+            canvas.drawText("...", 24f, y, bodyPaint)
+        }
+
+        return bitmap
+    }
+
+    private fun wrapTextForWidth(
+        text: String,
+        paint: Paint,
+        maxWidth: Float
+    ): List<String> {
+        if (text.isBlank()) return emptyList()
+        val result = mutableListOf<String>()
+        var remaining = text.trim()
+        while (remaining.isNotEmpty()) {
+            val count = paint.breakText(remaining, true, maxWidth, null).coerceAtLeast(1)
+            result += remaining.substring(0, count)
+            remaining = remaining.substring(count).trimStart()
+        }
+        return result
+    }
+
+    private fun jitterScreenCoords(x: Int, y: Int, maxJitterPx: Int): Pair<Int, Int> {
+        if (maxJitterPx <= 0) return x to y
+
+        val effectiveScale = if (currentScreenshotScale > 0f) currentScreenshotScale else 1.0f
+        val screenWidth = if (lastScreenshotWidth > 0) {
+            (lastScreenshotWidth / effectiveScale).roundToInt().coerceAtLeast(1)
+        } else {
+            null
+        }
+        val screenHeight = if (lastScreenshotHeight > 0) {
+            (lastScreenshotHeight / effectiveScale).roundToInt().coerceAtLeast(1)
+        } else {
+            null
+        }
+
+        var jitteredX = x + Random.nextInt(-maxJitterPx, maxJitterPx + 1)
+        var jitteredY = y + Random.nextInt(-maxJitterPx, maxJitterPx + 1)
+
+        if (jitteredX < 0) jitteredX = 0
+        if (jitteredY < 0) jitteredY = 0
+
+        screenWidth?.let { w ->
+            if (w > 0) {
+                jitteredX = jitteredX.coerceAtMost(w - 1)
+            }
+        }
+        screenHeight?.let { h ->
+            if (h > 0) {
+                jitteredY = jitteredY.coerceAtMost(h - 1)
+            }
+        }
+
+        return jitteredX to jitteredY
+    }
+
+    private fun jitterDurationMs(baseMs: Int, relativeRange: Float, minMs: Int = 50): Int {
+        if (relativeRange <= 0f) return baseMs.coerceAtLeast(minMs)
+        val span = (baseMs * relativeRange).roundToInt().coerceAtLeast(1)
+        val jittered = baseMs + Random.nextInt(-span, span + 1)
+        return jittered.coerceAtLeast(minMs)
+    }
+
+    private suspend fun previewTapCue(x: Int, y: Int) {
+        FloatingBubbleService.showTapCue(
+            context = appContext,
+            x = x,
+            y = y,
+            holdMs = TOOL_TAP_CUE_HOLD_MS,
+            fadeMs = TOOL_TAP_CUE_FADE_MS
+        )
+        delay(TOOL_TAP_CUE_HOLD_MS + TOOL_TAP_CUE_FADE_MS)
+    }
+
+    private suspend fun previewSwipeCue(startX: Int, startY: Int, endX: Int, endY: Int) {
+        FloatingBubbleService.showSwipeCue(
+            context = appContext,
+            startX = startX,
+            startY = startY,
+            endX = endX,
+            endY = endY,
+            holdMs = TOOL_SWIPE_CUE_HOLD_MS,
+            fadeMs = TOOL_SWIPE_CUE_FADE_MS
+        )
+        delay(TOOL_SWIPE_CUE_HOLD_MS + TOOL_SWIPE_CUE_FADE_MS)
+    }
+
+    private suspend fun previewSequenceCue(points: List<Pair<Int, Int>>) {
+        if (points.isEmpty()) return
+        FloatingBubbleService.showSequenceCue(
+            context = appContext,
+            points = points,
+            holdMs = TOOL_SEQUENCE_CUE_HOLD_MS,
+            fadeMs = TOOL_SEQUENCE_CUE_FADE_MS
+        )
+        delay(TOOL_SEQUENCE_CUE_HOLD_MS + TOOL_SEQUENCE_CUE_FADE_MS)
+    }
+
+    private fun getScreenSizeFromCurrentCapture(): Pair<Int, Int> {
+        val scale = currentScreenshotScale.takeIf { it > 0f } ?: 1f
+        if (lastScreenshotWidth > 0 && lastScreenshotHeight > 0) {
+            return (lastScreenshotWidth / scale).roundToInt() to (lastScreenshotHeight / scale).roundToInt()
+        }
+        val metrics = appContext.resources.displayMetrics
+        return metrics.widthPixels to metrics.heightPixels
+    }
+
+    private fun buildScrollPathOnScreen(isDown: Boolean): IntArray {
+        val (screenWidth, screenHeight) = getScreenSizeFromCurrentCapture()
+        val centerX = screenWidth / 2
+        val startY = if (isDown) (screenHeight * 0.7f).roundToInt() else (screenHeight * 0.3f).roundToInt()
+        val endY = if (isDown) (screenHeight * 0.3f).roundToInt() else (screenHeight * 0.7f).roundToInt()
+        return intArrayOf(centerX, startY, centerX, endY)
     }
 
     /**
@@ -633,6 +2019,7 @@ class AgentEngine(
                 val (x, y) = currentElementMap[elementId]
                     ?: throw IllegalArgumentException("Element #$elementId not found (available: ${currentElementMap.keys.sorted()})")
                 Log.d(TAG, "tap_element #$elementId -> ($x, $y)")
+                previewTapCue(x, y)
                 adbExecutor.tap(x, y).getOrThrow()
                 // Annotate screenshot with tap position
                 val scale = currentScreenshotScale
@@ -659,9 +2046,10 @@ class AgentEngine(
                 val (x, y) = currentElementMap[elementId]
                     ?: throw IllegalArgumentException("Element #$elementId not found (available: ${currentElementMap.keys.sorted()})")
                 Log.d(TAG, "input_element #$elementId -> tap($x, $y) then input '$text'")
+                previewTapCue(x, y)
                 adbExecutor.tap(x, y).getOrThrow()
                 delay(300)
-                adbExecutor.inputText(text).getOrThrow()
+                val inputResult = adbExecutor.inputText(text).getOrThrow()
                 // Annotate screenshot with tap position
                 val scale = currentScreenshotScale
                 lastScreenshotBase64?.let { screenshot ->
@@ -676,7 +2064,59 @@ class AgentEngine(
                         imageBase64 = annotated
                     ))
                 }
-                "Tapped element #$elementId at ($x, $y) and input '$text'"
+                "Tapped element #$elementId at ($x, $y) and input '$text' [$inputResult]"
+            }
+
+            "tap_element_sequence" -> {
+                val elements = args["elements"]?.jsonArray
+                    ?.map { it.jsonPrimitive.int }
+                    ?: throw IllegalArgumentException("tap_element_sequence requires 'elements'")
+                if (elements.isEmpty()) {
+                    throw IllegalArgumentException("tap_element_sequence requires at least one element")
+                }
+                if (elements.size > TAP_SEQUENCE_MAX_ELEMENTS) {
+                    throw IllegalArgumentException(
+                        "tap_element_sequence supports at most $TAP_SEQUENCE_MAX_ELEMENTS elements"
+                    )
+                }
+
+                val intervalMs = (args["interval_ms"]?.jsonPrimitive?.intOrNull
+                    ?: TAP_SEQUENCE_DEFAULT_INTERVAL_MS)
+                    .coerceIn(0, TAP_SEQUENCE_MAX_INTERVAL_MS)
+                val baseCoords = elements.map { elementId ->
+                    currentElementMap[elementId]
+                        ?: throw IllegalArgumentException(
+                            "Element #$elementId not found (available: ${currentElementMap.keys.sorted()})"
+                        )
+                }
+
+                Log.d(TAG, "tap_element_sequence ${elements.joinToString(prefix = "[", postfix = "]")}")
+                previewSequenceCue(baseCoords)
+                baseCoords.forEachIndexed { index, (x, y) ->
+                    adbExecutor.tap(x, y).getOrThrow()
+                    if (index != baseCoords.lastIndex && intervalMs > 0) {
+                        delay(intervalMs.toLong())
+                    }
+                }
+                lastScreenshotBase64?.let { screenshot ->
+                    val screenshotPoints = baseCoords.map { (x, y) -> mapScreenPointToScreenshot(x, y) }
+                    val annotated = annotateScreenshotWithSequence(
+                        imageBase64 = screenshot,
+                        points = screenshotPoints,
+                        label = "tap_element_sequence"
+                    )
+                    addLog(DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "连续点击路径标注",
+                        content = buildString {
+                            appendLine("elements=${elements.joinToString(prefix = "[", postfix = "]")}")
+                            append("实际坐标=${baseCoords.joinToString(prefix = "[", postfix = "]") { "(${it.first},${it.second})" }}")
+                        },
+                        imageBase64 = annotated
+                    ))
+                }
+
+                "Tapped ${elements.size} elements in sequence: ${elements.joinToString(" -> ") { "#$it" }}"
             }
 
             "tap" -> {
@@ -688,8 +2128,9 @@ class AgentEngine(
                 val x = if (scale > 0f && scale < 1f) (rawX / scale).toInt() else rawX
                 val y = if (scale > 0f && scale < 1f) (rawY / scale).toInt() else rawY
                 Log.d(TAG, "tap: AI coords ($rawX, $rawY) -> screen coords ($x, $y) [scale=$scale]")
+                previewTapCue(x, y)
                 adbExecutor.tap(x, y).getOrThrow()
-                // Annotate screenshot with tap position (rawX/rawY are already in screenshot coords)
+                // Annotate screenshot with tap position
                 lastScreenshotBase64?.let { screenshot ->
                     val label = "tap ($rawX,$rawY)->($x,$y)"
                     val annotated = annotateScreenshotWithTap(screenshot, rawX, rawY, label)
@@ -718,7 +2159,24 @@ class AgentEngine(
                 val sy = if (scale > 0f && scale < 1f) (rawSy / scale).toInt() else rawSy
                 val ex = if (scale > 0f && scale < 1f) (rawEx / scale).toInt() else rawEx
                 val ey = if (scale > 0f && scale < 1f) (rawEy / scale).toInt() else rawEy
-                adbExecutor.swipe(sx, sy, ex, ey, duration).getOrThrow()
+                val swipePath = buildSwipePath(sx, sy, ex, ey)
+                previewSwipeCue(sx, sy, ex, ey)
+                adbExecutor.swipePath(swipePath, duration).getOrThrow()
+                lastScreenshotBase64?.let { screenshot ->
+                    val screenshotPath = swipePath.map { (px, py) -> mapScreenPointToScreenshot(px, py) }
+                    val label = "swipe ($rawSx,$rawSy)->($rawEx,$rawEy)"
+                    val annotated = annotateScreenshotWithSwipe(
+                        imageBase64 = screenshot,
+                        pathPoints = screenshotPath,
+                        label = label
+                    )
+                    addLog(DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "滑动路径标注",
+                        content = "swipe 截图起点($rawSx,$rawSy) 终点($rawEx,$rawEy) 实际起点($sx,$sy) 终点($ex,$ey) 时长${duration}ms",
+                        imageBase64 = annotated
+                    ))
+                }
                 "Swiped from ($sx,$sy) to ($ex,$ey) in ${duration}ms"
             }
 
@@ -740,20 +2198,58 @@ class AgentEngine(
             }
 
             "scroll_down" -> {
+                val (previewStartX, previewStartY, previewEndX, previewEndY) = buildScrollPathOnScreen(isDown = true)
+                previewSwipeCue(previewStartX, previewStartY, previewEndX, previewEndY)
                 adbExecutor.scrollDown().getOrThrow()
+                lastScreenshotBase64?.let { screenshot ->
+                    val (sx, sy, ex, ey) = buildViewportScrollPath(isDown = true, screenshot)
+                    val annotated = annotateScreenshotWithSwipe(
+                        imageBase64 = screenshot,
+                        startX = sx,
+                        startY = sy,
+                        endX = ex,
+                        endY = ey,
+                        label = "scroll_down"
+                    )
+                    addLog(DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "滚动路径标注",
+                        content = "scroll_down 当前视图路径($sx,$sy)->($ex,$ey)",
+                        imageBase64 = annotated
+                    ))
+                }
                 "Scrolled down"
             }
 
             "scroll_up" -> {
+                val (previewStartX, previewStartY, previewEndX, previewEndY) = buildScrollPathOnScreen(isDown = false)
+                previewSwipeCue(previewStartX, previewStartY, previewEndX, previewEndY)
                 adbExecutor.scrollUp().getOrThrow()
+                lastScreenshotBase64?.let { screenshot ->
+                    val (sx, sy, ex, ey) = buildViewportScrollPath(isDown = false, screenshot)
+                    val annotated = annotateScreenshotWithSwipe(
+                        imageBase64 = screenshot,
+                        startX = sx,
+                        startY = sy,
+                        endX = ex,
+                        endY = ey,
+                        label = "scroll_up"
+                    )
+                    addLog(DebugLogEntry(
+                        type = DebugLogType.INFO,
+                        title = "滚动路径标注",
+                        content = "scroll_up 当前视图路径($sx,$sy)->($ex,$ey)",
+                        imageBase64 = annotated
+                    ))
+                }
                 "Scrolled up"
             }
 
             "input_text" -> {
                 val text = args["text"]?.jsonPrimitive?.content
                     ?: throw IllegalArgumentException("input_text requires 'text'")
-                adbExecutor.inputText(text).getOrThrow()
-                "Input text: '$text'"
+                val inputResult = adbExecutor.inputText(text).getOrThrow()
+                "Input text: '$text' [$inputResult]"
             }
 
             "key_event" -> {
@@ -823,34 +2319,41 @@ class AgentEngine(
                     imageBase64 = gridImage
                 ))
 
-                "已放大区域 $region，当前视口: (${newLeft.toInt()},${newTop.toInt()})-(${(newLeft+cellW).toInt()},${(newTop+cellH).toInt()})。请查看放大后的截图，选择子区域继续放大或点击。"
+                "已放大区域 $region，当前视口: (${newLeft.toInt()},${newTop.toInt()})-(${(newLeft+cellW).toInt()},${(newTop+cellH).toInt()})。请查看放大后的截图，选择子区域继续放大或点击；若目标靠边/靠角，可在 tap_region 里加 anchor。"
             }
 
             "tap_region" -> {
                 val region = args["region"]?.jsonPrimitive?.int
                     ?: throw IllegalArgumentException("tap_region requires 'region' parameter")
                 if (region !in 1..9) throw IllegalArgumentException("region must be 1-9, got $region")
+                val anchor = RegionTapResolver.resolveAnchor(
+                    explicitAnchor = args["anchor"]?.jsonPrimitive?.contentOrNull,
+                    description = args["description"]?.jsonPrimitive?.contentOrNull
+                )
 
-                val (x, y) = getZoneCenterCoords(region)
-                Log.d(TAG, "tap_region $region -> ($x, $y), zoomRect=$currentZoomRect")
+                val (x, y) = getZoneTapCoords(region, anchor)
+                Log.d(TAG, "tap_region $region anchor=${anchor.apiName} -> ($x, $y), zoomRect=$currentZoomRect")
 
+                previewTapCue(x, y)
                 adbExecutor.tap(x, y).getOrThrow()
 
                 // Annotate
                 lastScreenshotBase64?.let { screenshot ->
-                    val label = "tap_region $region ($x,$y)"
+                    val label = "tap_region $region/${anchor.apiName} ($x,$y)"
                     val bytes = Base64.decode(screenshot, Base64.NO_WRAP)
                     val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    val scrCol = (region - 1) % 3
-                    val scrRow = (region - 1) / 3
-                    val scrX = (bmp.width / 3 * scrCol + bmp.width / 6)
-                    val scrY = (bmp.height / 3 * scrRow + bmp.height / 6)
+                    val (scrX, scrY) = RegionTapResolver.calculateTapPoint(
+                        zone = region,
+                        viewportWidth = bmp.width.toFloat(),
+                        viewportHeight = bmp.height.toFloat(),
+                        anchor = anchor
+                    )
                     bmp.recycle()
                     val annotated = annotateScreenshotWithTap(screenshot, scrX, scrY, label)
                     addLog(DebugLogEntry(
                         type = DebugLogType.INFO,
                         title = "点击区域 $region",
-                        content = "tap_region $region 实际屏幕坐标($x,$y)",
+                        content = "tap_region $region anchor=${anchor.apiName} 实际屏幕坐标($x,$y)",
                         imageBase64 = annotated
                     ))
                 }
@@ -858,11 +2361,12 @@ class AgentEngine(
                 // Reset zoom state after tap
                 currentZoomRect = null
 
-                "Tapped region $region at screen coordinates ($x, $y)"
+                "Tapped region $region at screen coordinates ($x, $y) [anchor=${anchor.apiName}]"
             }
 
             "wait" -> {
-                val ms = args["duration"]?.jsonPrimitive?.intOrNull ?: 1000
+                val ms = (args["duration"]?.jsonPrimitive?.intOrNull ?: WAIT_DEFAULT_DURATION_MS)
+                    .coerceIn(WAIT_MIN_DURATION_MS, WAIT_MAX_DURATION_MS)
                 delay(ms.toLong())
                 "Waited ${ms}ms"
             }
@@ -929,10 +2433,22 @@ class AgentEngine(
         }
     }
 
+    private fun buildTextOnlyUserMessage(text: String): JsonObject {
+        return buildJsonObject {
+            put("role", "user")
+            put("content", text)
+        }
+    }
+
     /**
      * Build a user message with an image attachment.
      */
-    private fun buildUserMessageWithImage(text: String, imageBase64: String): JsonObject {
+    private fun buildUserMessageWithImage(
+        text: String,
+        imageBase64: String,
+        detail: String = MODEL_IMAGE_DETAIL_DEFAULT
+    ): JsonObject {
+        val modelImage = prepareImageForModel(imageBase64, detail)
         return buildJsonObject {
             put("role", "user")
             put("content", buildJsonArray {
@@ -943,8 +2459,8 @@ class AgentEngine(
                 add(buildJsonObject {
                     put("type", "image_url")
                     put("image_url", buildJsonObject {
-                        put("url", "data:image/png;base64,$imageBase64")
-                        put("detail", "high")
+                        put("url", "data:${modelImage.mimeType};base64,${modelImage.base64}")
+                        put("detail", detail)
                     })
                 })
             })
@@ -974,15 +2490,132 @@ class AgentEngine(
         }
     }
 
+    @Synchronized
+    fun submitCommand(
+        command: String,
+        scope: CoroutineScope,
+        inputTitle: String = "语音指令"
+    ): Boolean {
+        val normalizedCommand = command.trim()
+        if (normalizedCommand.isBlank()) return false
+        if (currentJob?.isActive == true || _agentState.value.isRunning) return false
+
+        val job = scope.launch {
+            executeCommand(normalizedCommand, inputTitle)
+        }
+        setCurrentJob(job)
+        return true
+    }
+
+    @Synchronized
     fun cancel() {
         currentJob?.cancel()
         currentJob = null
         _overlayVisible.value = true
-        _agentState.value = AgentState(statusMessage = "已取消")
+        val current = _agentState.value
+        if (!current.isRunning) {
+            val now = System.currentTimeMillis()
+            _agentState.value = current.copy(
+                statusMessage = "已取消",
+                lastAction = "用户取消任务",
+                phaseStartedAtMs = now,
+                lastProgressAtMs = now
+            )
+        }
     }
 
+    @Synchronized
     fun setCurrentJob(job: Job) {
         currentJob = job
+        job.invokeOnCompletion {
+            synchronized(this) {
+                if (currentJob === job) {
+                    currentJob = null
+                }
+            }
+        }
+    }
+
+    private fun resetCaptureStateForNewTask() {
+        currentElementMap = emptyMap()
+        currentScreenshotScale = 1.0f
+        lastScreenshotWidth = 0
+        lastScreenshotHeight = 0
+        lastScreenshotBase64 = null
+        currentZoomRect = null
+        uiDumpCooldownRemaining = 0
+        uiDumpFailureStreak = 0
+    }
+
+    private fun settleDelayForTool(toolName: String): Long {
+        return when (toolName) {
+            "tap_element_sequence" -> TAP_SEQUENCE_SETTLE_DELAY_MS
+            else -> ACTION_SETTLE_DELAY_MS
+        }
+    }
+
+    private fun shouldCaptureAfterToolCalls(toolCalls: List<ToolCall>): Boolean {
+        return toolCalls.any { toolCall ->
+            when (toolCall.functionName) {
+                "zoom_region",
+                "load_skills",
+                "save_skill",
+                "detect_current_app",
+                "complete" -> false
+
+                else -> true
+            }
+        }
+    }
+
+    private fun registerUiDumpFailure(reason: String) {
+        uiDumpFailureStreak++
+        if (uiDumpFailureStreak < UI_DUMP_FAILURES_BEFORE_COOLDOWN) return
+
+        uiDumpFailureStreak = 0
+        uiDumpCooldownRemaining = UI_DUMP_COOLDOWN_CAPTURES
+        addLog(
+            DebugLogEntry(
+                type = DebugLogType.INFO,
+                title = "控件树降级",
+                content = "控件树连续抓取失败，接下来 $UI_DUMP_COOLDOWN_CAPTURES 次截图将跳过界面树抓取。最近错误: $reason"
+            )
+        )
+    }
+
+    private data class ModelImagePayload(
+        val base64: String,
+        val mimeType: String
+    )
+
+    private fun prepareImageForModel(imageBase64: String, detail: String): ModelImagePayload {
+        val bytes = runCatching { Base64.decode(imageBase64, Base64.NO_WRAP) }.getOrNull()
+            ?: return ModelImagePayload(imageBase64, "image/png")
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            ?: return ModelImagePayload(imageBase64, "image/png")
+        val quality = if (detail == MODEL_IMAGE_DETAIL_ZOOM) {
+            MODEL_ZOOM_IMAGE_JPEG_QUALITY
+        } else {
+            MODEL_IMAGE_JPEG_QUALITY
+        }
+
+        return try {
+            ModelImagePayload(
+                base64 = bitmapToBase64(
+                    bitmap = bitmap,
+                    format = Bitmap.CompressFormat.JPEG,
+                    quality = quality
+                ),
+                mimeType = "image/jpeg"
+            )
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun decodeMutableBitmapOrThrow(imageBase64: String): Bitmap {
+        return ImageMemoryUtils.decodeBase64ToMutableBitmap(imageBase64)
+            ?: throw IllegalArgumentException("Failed to decode image for annotation")
     }
 
     /**
@@ -995,41 +2628,182 @@ class AgentEngine(
         tapY: Int,
         label: String
     ): String {
-        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
-        val original = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(annotated)
-        canvas.drawBitmap(original, 0f, 0f, null)
-        original.recycle()
+        val annotated = decodeMutableBitmapOrThrow(imageBase64)
+        return try {
+            val canvas = Canvas(annotated)
+            val paint = Paint(Paint.ANTI_ALIAS_FLAG)
 
-        val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+            paint.color = Color.RED
+            paint.style = Paint.Style.STROKE
+            paint.strokeWidth = 3f
+            canvas.drawCircle(tapX.toFloat(), tapY.toFloat(), 25f, paint)
 
-        // Red circle outline
-        paint.color = Color.RED
-        paint.style = Paint.Style.STROKE
-        paint.strokeWidth = 3f
-        canvas.drawCircle(tapX.toFloat(), tapY.toFloat(), 25f, paint)
+            canvas.drawLine((tapX - 40).toFloat(), tapY.toFloat(), (tapX + 40).toFloat(), tapY.toFloat(), paint)
+            canvas.drawLine(tapX.toFloat(), (tapY - 40).toFloat(), tapX.toFloat(), (tapY + 40).toFloat(), paint)
 
-        // Crosshair lines
-        canvas.drawLine((tapX - 40).toFloat(), tapY.toFloat(), (tapX + 40).toFloat(), tapY.toFloat(), paint)
-        canvas.drawLine(tapX.toFloat(), (tapY - 40).toFloat(), tapX.toFloat(), (tapY + 40).toFloat(), paint)
+            paint.style = Paint.Style.FILL
+            canvas.drawCircle(tapX.toFloat(), tapY.toFloat(), 5f, paint)
 
-        // Center dot (filled)
-        paint.style = Paint.Style.FILL
-        canvas.drawCircle(tapX.toFloat(), tapY.toFloat(), 5f, paint)
+            paint.textSize = 28f
+            paint.color = Color.WHITE
+            val textBounds = Rect()
+            paint.getTextBounds(label, 0, label.length, textBounds)
+            val textX = (tapX + 30).toFloat()
+            val textY = (tapY - 30).toFloat()
 
-        // Text label with semi-transparent black background
-        paint.textSize = 28f
-        paint.color = Color.WHITE
+            val bgPaint = Paint().apply {
+                color = Color.argb(160, 0, 0, 0)
+                style = Paint.Style.FILL
+            }
+            canvas.drawRect(
+                textX - 4f,
+                textY + textBounds.top - 4f,
+                textX + textBounds.width() + 4f,
+                textY + textBounds.bottom + 4f,
+                bgPaint
+            )
+
+            canvas.drawText(label, textX, textY, paint)
+            bitmapToBase64(annotated)
+        } finally {
+            annotated.recycle()
+        }
+    }
+
+    private fun buildSwipePath(
+        startX: Int,
+        startY: Int,
+        endX: Int,
+        endY: Int,
+        pointCount: Int = 6
+    ): List<Pair<Int, Int>> {
+        val safePointCount = pointCount.coerceAtLeast(2)
+        val points = (0 until safePointCount).map { index ->
+            val progress = index.toFloat() / (safePointCount - 1).toFloat()
+            Pair(
+                (startX + (endX - startX) * progress).roundToInt(),
+                (startY + (endY - startY) * progress).roundToInt()
+            )
+        }.distinct()
+
+        return if (points.size >= 2) {
+            points
+        } else {
+            listOf(startX to startY, endX to endY)
+        }
+    }
+
+    private fun annotateScreenshotWithSwipe(
+        imageBase64: String,
+        startX: Int,
+        startY: Int,
+        endX: Int,
+        endY: Int,
+        label: String
+    ): String = annotateScreenshotWithSwipe(
+        imageBase64 = imageBase64,
+        pathPoints = listOf(startX to startY, endX to endY),
+        label = label
+    )
+
+    private fun annotateScreenshotWithSwipe(
+        imageBase64: String,
+        pathPoints: List<Pair<Int, Int>>,
+        label: String
+    ): String {
+        require(pathPoints.size >= 2) { "annotateScreenshotWithSwipe requires at least 2 points" }
+
+        val (startX, startY) = pathPoints.first()
+        val (endX, endY) = pathPoints.last()
+        val annotated = decodeMutableBitmapOrThrow(imageBase64)
+        return try {
+            val canvas = Canvas(annotated)
+
+            val pathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.RED
+                style = Paint.Style.STROKE
+                strokeWidth = 8f
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            pathPoints.zipWithNext().forEach { (start, end) ->
+                canvas.drawLine(
+                    start.first.toFloat(),
+                    start.second.toFloat(),
+                    end.first.toFloat(),
+                    end.second.toFloat(),
+                    pathPaint
+                )
+            }
+
+            val penultimate = pathPoints[pathPoints.lastIndex - 1]
+            val angle = atan2(
+                (endY - penultimate.second).toFloat(),
+                (endX - penultimate.first).toFloat()
+            )
+            val arrowLength = 30f
+            val arrowSpread = 0.55f
+            val arrowX1 = endX - arrowLength * cos(angle - arrowSpread)
+            val arrowY1 = endY - arrowLength * sin(angle - arrowSpread)
+            val arrowX2 = endX - arrowLength * cos(angle + arrowSpread)
+            val arrowY2 = endY - arrowLength * sin(angle + arrowSpread)
+            canvas.drawLine(endX.toFloat(), endY.toFloat(), arrowX1.toFloat(), arrowY1.toFloat(), pathPaint)
+            canvas.drawLine(endX.toFloat(), endY.toFloat(), arrowX2.toFloat(), arrowY2.toFloat(), pathPaint)
+
+            val startPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(220, 0, 200, 83)
+                style = Paint.Style.FILL
+            }
+            val endPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(220, 244, 67, 54)
+                style = Paint.Style.FILL
+            }
+            val markerOutlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+            }
+            canvas.drawCircle(startX.toFloat(), startY.toFloat(), 14f, startPaint)
+            canvas.drawCircle(endX.toFloat(), endY.toFloat(), 14f, endPaint)
+            canvas.drawCircle(startX.toFloat(), startY.toFloat(), 18f, markerOutlinePaint)
+            canvas.drawCircle(endX.toFloat(), endY.toFloat(), 18f, markerOutlinePaint)
+
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = 28f
+                color = Color.WHITE
+                style = Paint.Style.FILL
+            }
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(160, 0, 0, 0)
+                style = Paint.Style.FILL
+            }
+            drawAnnotationLabel(canvas, textPaint, bgPaint, "START", startX + 24f, startY - 20f)
+            drawAnnotationLabel(canvas, textPaint, bgPaint, "END", endX + 24f, endY - 20f)
+            drawAnnotationLabel(
+                canvas,
+                textPaint,
+                bgPaint,
+                label,
+                ((startX + endX) / 2f) + 24f,
+                ((startY + endY) / 2f) - 24f
+            )
+
+            bitmapToBase64(annotated)
+        } finally {
+            annotated.recycle()
+        }
+    }
+
+    private fun drawAnnotationLabel(
+        canvas: Canvas,
+        textPaint: Paint,
+        bgPaint: Paint,
+        label: String,
+        textX: Float,
+        textY: Float
+    ) {
         val textBounds = Rect()
-        paint.getTextBounds(label, 0, label.length, textBounds)
-        val textX = (tapX + 30).toFloat()
-        val textY = (tapY - 30).toFloat()
-
-        // Background rect
-        val bgPaint = Paint()
-        bgPaint.color = Color.argb(160, 0, 0, 0)
-        bgPaint.style = Paint.Style.FILL
+        textPaint.getTextBounds(label, 0, label.length, textBounds)
         canvas.drawRect(
             textX - 4f,
             textY + textBounds.top - 4f,
@@ -1037,13 +2811,120 @@ class AgentEngine(
             textY + textBounds.bottom + 4f,
             bgPaint
         )
+        canvas.drawText(label, textX, textY, textPaint)
+    }
 
-        // Label text
-        canvas.drawText(label, textX, textY, paint)
+    private fun annotateScreenshotWithSequence(
+        imageBase64: String,
+        points: List<Pair<Int, Int>>,
+        label: String
+    ): String {
+        if (points.isEmpty()) return imageBase64
 
-        val result = bitmapToBase64(annotated)
-        annotated.recycle()
-        return result
+        val annotated = decodeMutableBitmapOrThrow(imageBase64)
+        return try {
+            val canvas = Canvas(annotated)
+
+            val pathPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(230, 255, 152, 0)
+                style = Paint.Style.STROKE
+                strokeWidth = 7f
+                strokeCap = Paint.Cap.ROUND
+                strokeJoin = Paint.Join.ROUND
+            }
+            points.zipWithNext { start, end ->
+                canvas.drawLine(
+                    start.first.toFloat(),
+                    start.second.toFloat(),
+                    end.first.toFloat(),
+                    end.second.toFloat(),
+                    pathPaint
+                )
+            }
+
+            val markerPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                style = Paint.Style.FILL
+                textAlign = Paint.Align.CENTER
+                textSize = 24f
+            }
+            val outlinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
+            }
+            val numberPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE
+                style = Paint.Style.FILL
+                textAlign = Paint.Align.CENTER
+                textSize = 24f
+            }
+
+            points.forEachIndexed { index, (x, y) ->
+                markerPaint.color = when (index) {
+                    0 -> Color.argb(220, 76, 175, 80)
+                    points.lastIndex -> Color.argb(220, 244, 67, 54)
+                    else -> Color.argb(220, 255, 152, 0)
+                }
+                canvas.drawCircle(x.toFloat(), y.toFloat(), 18f, markerPaint)
+                canvas.drawCircle(x.toFloat(), y.toFloat(), 21f, outlinePaint)
+                val baseline = y - (numberPaint.descent() + numberPaint.ascent()) / 2f
+                canvas.drawText((index + 1).toString(), x.toFloat(), baseline, numberPaint)
+            }
+
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                textSize = 28f
+                color = Color.WHITE
+                style = Paint.Style.FILL
+            }
+            val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(160, 0, 0, 0)
+                style = Paint.Style.FILL
+            }
+            drawAnnotationLabel(
+                canvas,
+                textPaint,
+                bgPaint,
+                label,
+                points.first().first + 28f,
+                points.first().second - 28f
+            )
+
+            bitmapToBase64(annotated)
+        } finally {
+            annotated.recycle()
+        }
+    }
+
+    private fun mapScreenPointToScreenshot(x: Int, y: Int): Pair<Int, Int> {
+        val scale = if (currentScreenshotScale > 0f) currentScreenshotScale else 1.0f
+        val rect = currentZoomRect
+        return if (rect != null) {
+            Pair(
+                ((x - rect.left) * scale).roundToInt(),
+                ((y - rect.top) * scale).roundToInt()
+            )
+        } else {
+            Pair(
+                (x * scale).roundToInt(),
+                (y * scale).roundToInt()
+            )
+        }
+    }
+
+    private fun buildViewportScrollPath(
+        isDown: Boolean,
+        imageBase64: String
+    ): IntArray {
+        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
+        val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        val width = bitmap.width
+        val height = bitmap.height
+        bitmap.recycle()
+
+        val centerX = width / 2
+        val startY = if (isDown) (height * 0.7f).roundToInt() else (height * 0.3f).roundToInt()
+        val endY = if (isDown) (height * 0.3f).roundToInt() else (height * 0.7f).roundToInt()
+        return intArrayOf(centerX, startY, centerX, endY)
     }
 
     /**
@@ -1051,58 +2932,49 @@ class AgentEngine(
      * Returns the annotated image as base64.
      */
     private fun drawZoneGrid(imageBase64: String): String {
-        val bytes = Base64.decode(imageBase64, Base64.NO_WRAP)
-        val original = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-        val annotated = Bitmap.createBitmap(original.width, original.height, original.config ?: Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(annotated)
-        canvas.drawBitmap(original, 0f, 0f, null)
-        original.recycle()
+        val annotated = decodeMutableBitmapOrThrow(imageBase64)
+        return try {
+            val canvas = Canvas(annotated)
+            val w = annotated.width.toFloat()
+            val h = annotated.height.toFloat()
+            val cellW = w / 3f
+            val cellH = h / 3f
 
-        val w = annotated.width.toFloat()
-        val h = annotated.height.toFloat()
-        val cellW = w / 3f
-        val cellH = h / 3f
-
-        // Draw grid lines
-        val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(128, 0, 255, 0) // semi-transparent green
-            style = Paint.Style.STROKE
-            strokeWidth = 3f
-        }
-        // Vertical lines
-        canvas.drawLine(cellW, 0f, cellW, h, linePaint)
-        canvas.drawLine(cellW * 2, 0f, cellW * 2, h, linePaint)
-        // Horizontal lines
-        canvas.drawLine(0f, cellH, w, cellH, linePaint)
-        canvas.drawLine(0f, cellH * 2, w, cellH * 2, linePaint)
-
-        // Draw zone numbers
-        val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.argb(180, 0, 255, 0)
-            textSize = 48f
-            textAlign = Paint.Align.CENTER
-            typeface = android.graphics.Typeface.DEFAULT_BOLD
-        }
-        val bgPaint = Paint().apply {
-            color = Color.argb(100, 0, 0, 0)
-            style = Paint.Style.FILL
-        }
-
-        for (row in 0..2) {
-            for (col in 0..2) {
-                val zone = row * 3 + col + 1
-                val cx = cellW * col + cellW / 2
-                val cy = cellH * row + cellH / 2
-                // Background circle behind number
-                canvas.drawCircle(cx, cy, 30f, bgPaint)
-                // Zone number
-                canvas.drawText(zone.toString(), cx, cy + 16f, textPaint)
+            val linePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(128, 0, 255, 0)
+                style = Paint.Style.STROKE
+                strokeWidth = 3f
             }
-        }
+            canvas.drawLine(cellW, 0f, cellW, h, linePaint)
+            canvas.drawLine(cellW * 2, 0f, cellW * 2, h, linePaint)
+            canvas.drawLine(0f, cellH, w, cellH, linePaint)
+            canvas.drawLine(0f, cellH * 2, w, cellH * 2, linePaint)
 
-        val result = bitmapToBase64(annotated)
-        annotated.recycle()
-        return result
+            val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.argb(180, 0, 255, 0)
+                textSize = 48f
+                textAlign = Paint.Align.CENTER
+                typeface = android.graphics.Typeface.DEFAULT_BOLD
+            }
+            val bgPaint = Paint().apply {
+                color = Color.argb(100, 0, 0, 0)
+                style = Paint.Style.FILL
+            }
+
+            for (row in 0..2) {
+                for (col in 0..2) {
+                    val zone = row * 3 + col + 1
+                    val cx = cellW * col + cellW / 2
+                    val cy = cellH * row + cellH / 2
+                    canvas.drawCircle(cx, cy, 30f, bgPaint)
+                    canvas.drawText(zone.toString(), cx, cy + 16f, textPaint)
+                }
+            }
+
+            bitmapToBase64(annotated)
+        } finally {
+            annotated.recycle()
+        }
     }
 
     /**
@@ -1128,10 +3000,13 @@ class AgentEngine(
     }
 
     /**
-     * Calculate the center point of a zone (1-9) within the current zoom viewport.
+     * Calculate the tap point of a zone (1-9) within the current zoom viewport.
      * Returns (x, y) in REAL screen coordinates suitable for adbExecutor.tap().
      */
-    private fun getZoneCenterCoords(zone: Int): Pair<Int, Int> {
+    private fun getZoneTapCoords(
+        zone: Int,
+        anchor: RegionAnchor = RegionAnchor.CENTER
+    ): Pair<Int, Int> {
         val rect = currentZoomRect
         val screenWidth: Float
         val screenHeight: Float
@@ -1159,21 +3034,22 @@ class AgentEngine(
             offsetY = 0f
         }
 
-        val col = (zone - 1) % 3
-        val row = (zone - 1) / 3
-        val cellW = screenWidth / 3f
-        val cellH = screenHeight / 3f
-        val centerX = (offsetX + cellW * col + cellW / 2f).toInt()
-        val centerY = (offsetY + cellH * row + cellH / 2f).toInt()
-
-        return Pair(centerX, centerY)
+        return RegionTapResolver.calculateTapPoint(
+            zone = zone,
+            viewportWidth = screenWidth,
+            viewportHeight = screenHeight,
+            offsetX = offsetX,
+            offsetY = offsetY,
+            anchor = anchor
+        )
     }
 
-    private fun bitmapToBase64(bitmap: Bitmap): String {
-        val outputStream = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-        val bytes = outputStream.toByteArray()
-        return Base64.encodeToString(bytes, Base64.NO_WRAP)
+    private fun bitmapToBase64(
+        bitmap: Bitmap,
+        format: Bitmap.CompressFormat = Bitmap.CompressFormat.PNG,
+        quality: Int = 100
+    ): String {
+        return ImageMemoryUtils.encodeBitmapToBase64(bitmap, format, quality)
     }
 
     private fun formatTimestamp(millis: Long): String {
@@ -1188,8 +3064,127 @@ class AgentEngine(
      */
     data class UiTreeResult(
         val text: String,
-        val elementMap: Map<Int, Pair<Int, Int>>
+        val elementMap: Map<Int, Pair<Int, Int>>,
+        val packageName: String,
+        val activeText: String,
+        val visibleTexts: List<String>,
+        val tokenElementMap: Map<String, Int>
     )
+
+    private fun simplifyAccessibilityTree(
+        snapshot: UiTreeAccessibilityService.AccessibilityTreeSnapshot
+    ): UiTreeResult? {
+        try {
+            val lines = mutableListOf<String>()
+            val elementMap = mutableMapOf<Int, Pair<Int, Int>>()
+            val visibleTexts = linkedSetOf<String>()
+            val tokenElementMap = linkedMapOf<String, Int>()
+            var packageName = snapshot.packageName
+            var activeText = ""
+            var elementNumber = 0
+
+            snapshot.nodes.forEach { node ->
+                val text = node.text
+                val contentDesc = node.contentDesc
+                val resourceId = node.resourceId
+                val className = node.className
+                val clickable = node.clickable
+                val focusable = node.focusable
+                val focused = node.focused
+                val enabled = node.enabled
+                val visible = node.visible
+                if (packageName.isBlank()) {
+                    packageName = node.packageName
+                }
+
+                if (!visible) return@forEach
+                if (text.isEmpty() && contentDesc.isEmpty() && resourceId.isEmpty() && !clickable) return@forEach
+                if (text.isNotBlank()) visibleTexts += text
+                if (contentDesc.isNotBlank()) visibleTexts += contentDesc
+                if ((focused || className.endsWith("EditText")) && text.isNotBlank()) {
+                    activeText = text
+                }
+
+                val isInteractive = clickable || focusable
+                val shortClass = className.substringAfterLast(".")
+                val line = buildString {
+                    if (isInteractive) {
+                        elementNumber++
+                        append("#")
+                        append(elementNumber)
+                        append(' ')
+                        val centerX = (node.left + node.right) / 2
+                        val centerY = (node.top + node.bottom) / 2
+                        elementMap[elementNumber] = Pair(centerX, centerY)
+                        deriveStableKeypadToken(
+                            resourceId = resourceId.substringAfterLast("/"),
+                            text = text,
+                            contentDesc = contentDesc
+                        )?.let { token ->
+                            tokenElementMap.putIfAbsent(token, elementNumber)
+                        }
+                    }
+
+                    append("[")
+                    append(shortClass)
+                    append("]")
+                    if (text.isNotEmpty()) {
+                        append(' ')
+                        append("\"")
+                        append(text.take(50))
+                        append("\"")
+                    }
+                    if (contentDesc.isNotEmpty() && contentDesc != text) {
+                        append(' ')
+                        append("desc=\"")
+                        append(contentDesc.take(40))
+                        append("\"")
+                    }
+                    if (resourceId.isNotEmpty()) {
+                        append(' ')
+                        append("id=")
+                        append(resourceId.substringAfterLast("/"))
+                    }
+
+                    var needsFlagSeparator = true
+                    if (clickable) {
+                        append(' ')
+                        append("clickable")
+                        needsFlagSeparator = false
+                    }
+                    if (focusable) {
+                        append(if (needsFlagSeparator) ' ' else ',')
+                        append("focusable")
+                        needsFlagSeparator = false
+                    }
+                    if (!enabled) {
+                        append(if (needsFlagSeparator) ' ' else ',')
+                        append("disabled")
+                    }
+                }
+
+                lines.add(line)
+            }
+
+            if (lines.isEmpty()) return null
+            val resultText = if (lines.size > MAX_UI_TREE_LINES) {
+                lines.take(MAX_UI_TREE_LINES).joinToString("\n") + "\n... (${lines.size - MAX_UI_TREE_LINES} more nodes)"
+            } else {
+                lines.joinToString("\n")
+            }
+            return UiTreeResult(
+                text = resultText,
+                elementMap = elementMap,
+                packageName = packageName,
+                activeText = activeText,
+                visibleTexts = visibleTexts.toList(),
+                tokenElementMap = tokenElementMap
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to simplify accessibility tree: ${e.message}")
+            return null
+        }
+    }
 
     /**
      * Simplify raw uiautomator XML into a compact text representation.
@@ -1202,15 +3197,15 @@ class AgentEngine(
         try {
             val lines = mutableListOf<String>()
             val elementMap = mutableMapOf<Int, Pair<Int, Int>>()
+            val visibleTexts = linkedSetOf<String>()
+            val tokenElementMap = linkedMapOf<String, Int>()
+            var packageName = ""
+            var activeText = ""
             var elementNumber = 0
-            val boundsRegex = Regex("""\[(\d+),(\d+)\]\[(\d+),(\d+)\]""")
 
-            val nodeRegex = Regex("""<node\s+([^>]+?)/?>\s*""")
-            val attrRegex = Regex("""(\w[\w-]*)="([^"]*?)"""")
-
-            for (nodeMatch in nodeRegex.findAll(xml)) {
+            for (nodeMatch in UI_NODE_REGEX.findAll(xml)) {
                 val attrs = mutableMapOf<String, String>()
-                for (attrMatch in attrRegex.findAll(nodeMatch.groupValues[1])) {
+                for (attrMatch in UI_ATTR_REGEX.findAll(nodeMatch.groupValues[1])) {
                     attrs[attrMatch.groupValues[1]] = attrMatch.groupValues[2]
                 }
 
@@ -1221,54 +3216,105 @@ class AgentEngine(
                 val bounds = attrs["bounds"] ?: ""
                 val clickable = attrs["clickable"] == "true"
                 val focusable = attrs["focusable"] == "true"
+                val focused = attrs["focused"] == "true"
                 val enabled = attrs["enabled"] != "false"
                 val visible = attrs["visible-to-user"] != "false"
+                if (packageName.isBlank()) {
+                    packageName = attrs["package"].orEmpty()
+                }
 
                 if (!visible) continue
                 if (text.isEmpty() && contentDesc.isEmpty() && resourceId.isEmpty() && !clickable) continue
+                if (text.isNotBlank()) visibleTexts += text
+                if (contentDesc.isNotBlank()) visibleTexts += contentDesc
+                if ((focused || className.endsWith("EditText")) && text.isNotBlank()) {
+                    activeText = text
+                }
 
                 val isInteractive = clickable || focusable
 
                 val shortClass = className.substringAfterLast(".")
-                val parts = mutableListOf<String>()
+                val line = buildString {
+                    if (isInteractive) {
+                        elementNumber++
+                        append("#")
+                        append(elementNumber)
+                        append(' ')
 
-                if (isInteractive) {
-                    elementNumber++
-                    parts.add("#$elementNumber")
+                        val boundsMatch = UI_BOUNDS_REGEX.find(bounds)
+                        if (boundsMatch != null) {
+                            val left = boundsMatch.groupValues[1].toInt()
+                            val top = boundsMatch.groupValues[2].toInt()
+                            val right = boundsMatch.groupValues[3].toInt()
+                            val bottom = boundsMatch.groupValues[4].toInt()
+                            val centerX = (left + right) / 2
+                            val centerY = (top + bottom) / 2
+                            elementMap[elementNumber] = Pair(centerX, centerY)
+                        }
+                        deriveStableKeypadToken(
+                            resourceId = resourceId.substringAfterLast("/"),
+                            text = text,
+                            contentDesc = contentDesc
+                        )?.let { token ->
+                            tokenElementMap.putIfAbsent(token, elementNumber)
+                        }
+                    }
 
-                    val boundsMatch = boundsRegex.find(bounds)
-                    if (boundsMatch != null) {
-                        val left = boundsMatch.groupValues[1].toInt()
-                        val top = boundsMatch.groupValues[2].toInt()
-                        val right = boundsMatch.groupValues[3].toInt()
-                        val bottom = boundsMatch.groupValues[4].toInt()
-                        val centerX = (left + right) / 2
-                        val centerY = (top + bottom) / 2
-                        elementMap[elementNumber] = Pair(centerX, centerY)
+                    append("[")
+                    append(shortClass)
+                    append("]")
+                    if (text.isNotEmpty()) {
+                        append(' ')
+                        append("\"")
+                        append(text.take(50))
+                        append("\"")
+                    }
+                    if (contentDesc.isNotEmpty() && contentDesc != text) {
+                        append(' ')
+                        append("desc=\"")
+                        append(contentDesc.take(40))
+                        append("\"")
+                    }
+                    if (resourceId.isNotEmpty()) {
+                        append(' ')
+                        append("id=")
+                        append(resourceId.substringAfterLast("/"))
+                    }
+
+                    var needsFlagSeparator = true
+                    if (clickable) {
+                        append(' ')
+                        append("clickable")
+                        needsFlagSeparator = false
+                    }
+                    if (focusable) {
+                        append(if (needsFlagSeparator) ' ' else ',')
+                        append("focusable")
+                        needsFlagSeparator = false
+                    }
+                    if (!enabled) {
+                        append(if (needsFlagSeparator) ' ' else ',')
+                        append("disabled")
                     }
                 }
 
-                parts.add("[$shortClass]")
-                if (text.isNotEmpty()) parts.add("\"${text.take(50)}\"")
-                if (contentDesc.isNotEmpty() && contentDesc != text) parts.add("desc=\"${contentDesc.take(40)}\"")
-                if (resourceId.isNotEmpty()) parts.add("id=${resourceId.substringAfterLast("/")}")
-
-                val flags = mutableListOf<String>()
-                if (clickable) flags.add("clickable")
-                if (focusable) flags.add("focusable")
-                if (!enabled) flags.add("disabled")
-                if (flags.isNotEmpty()) parts.add(flags.joinToString(","))
-
-                lines.add(parts.joinToString(" "))
+                lines.add(line)
             }
 
             if (lines.isEmpty()) return null
-            val resultText = if (lines.size > 150) {
-                lines.take(150).joinToString("\n") + "\n... (${lines.size - 150} more nodes)"
+            val resultText = if (lines.size > MAX_UI_TREE_LINES) {
+                lines.take(MAX_UI_TREE_LINES).joinToString("\n") + "\n... (${lines.size - MAX_UI_TREE_LINES} more nodes)"
             } else {
                 lines.joinToString("\n")
             }
-            return UiTreeResult(text = resultText, elementMap = elementMap)
+            return UiTreeResult(
+                text = resultText,
+                elementMap = elementMap,
+                packageName = packageName,
+                activeText = activeText,
+                visibleTexts = visibleTexts.toList(),
+                tokenElementMap = tokenElementMap
+            )
         } catch (e: Exception) {
             Log.w(TAG, "Failed to simplify UI tree: ${e.message}")
             return null

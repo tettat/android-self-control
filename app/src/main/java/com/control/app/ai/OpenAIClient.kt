@@ -2,6 +2,7 @@ package com.control.app.ai
 
 import android.util.Log
 import com.control.app.agent.AIChatResult
+import com.control.app.agent.DebugLogImage
 import com.control.app.agent.ToolCall
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -9,6 +10,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -17,6 +19,8 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.EventListener
+import okhttp3.Headers
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -29,9 +33,104 @@ import kotlin.coroutines.resumeWithException
 
 class OpenAIClient {
 
+    data class RequestTiming(
+        val totalMs: Long,
+        val uploadMs: Long? = null,
+        val modelMs: Long? = null
+    )
+
+    data class ToolChatResponse(
+        val result: AIChatResult,
+        val timing: RequestTiming
+    )
+
+    data class HttpLogEntry(
+        val title: String,
+        val content: String,
+        val imageBase64: String? = null,
+        val imageMimeType: String? = null,
+        val images: List<DebugLogImage> = imageBase64?.let {
+            listOf(DebugLogImage(base64 = it, mimeType = imageMimeType))
+        } ?: emptyList()
+    )
+
     companion object {
         private const val TAG = "OpenAIClient"
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
+        private val DATA_IMAGE_URL_REGEX = Regex(
+            pattern = "^data:(image/[^;]+);base64,(.+)$",
+            options = setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        )
+    }
+
+    private data class ExecutedRequest(
+        val body: String,
+        val timing: RequestTiming
+    )
+
+    private class CallTimingCollector : EventListener() {
+        private var callStartNs: Long? = null
+        private var requestBodyStartNs: Long? = null
+        private var requestBodyEndNs: Long? = null
+        private var responseHeadersStartNs: Long? = null
+        private var responseBodyEndNs: Long? = null
+        private var callEndNs: Long? = null
+
+        override fun callStart(call: Call) {
+            callStartNs = System.nanoTime()
+        }
+
+        override fun requestBodyStart(call: Call) {
+            requestBodyStartNs = System.nanoTime()
+        }
+
+        override fun requestBodyEnd(call: Call, byteCount: Long) {
+            if (requestBodyStartNs == null) {
+                requestBodyStartNs = callStartNs
+            }
+            requestBodyEndNs = System.nanoTime()
+        }
+
+        override fun responseHeadersStart(call: Call) {
+            responseHeadersStartNs = System.nanoTime()
+        }
+
+        override fun responseBodyEnd(call: Call, byteCount: Long) {
+            responseBodyEndNs = System.nanoTime()
+        }
+
+        override fun callEnd(call: Call) {
+            callEndNs = System.nanoTime()
+        }
+
+        override fun callFailed(call: Call, ioe: IOException) {
+            callEndNs = System.nanoTime()
+        }
+
+        fun snapshot(): RequestTiming {
+            val totalMs = durationMs(
+                startNs = callStartNs ?: requestBodyStartNs ?: responseHeadersStartNs,
+                endNs = callEndNs ?: responseBodyEndNs ?: responseHeadersStartNs ?: requestBodyEndNs
+            ) ?: 0L
+            val uploadMs = durationMs(
+                startNs = requestBodyStartNs ?: callStartNs,
+                endNs = requestBodyEndNs
+            )
+            val modelMs = durationMs(
+                startNs = requestBodyEndNs ?: requestBodyStartNs ?: callStartNs,
+                endNs = responseHeadersStartNs
+            )
+            return RequestTiming(
+                totalMs = totalMs,
+                uploadMs = uploadMs,
+                modelMs = modelMs
+            )
+        }
+
+        private fun durationMs(startNs: Long?, endNs: Long?): Long? {
+            if (startNs == null || endNs == null) return null
+            return TimeUnit.NANOSECONDS.toMillis((endNs - startNs).coerceAtLeast(0L))
+        }
     }
 
     private val json = Json {
@@ -41,6 +140,7 @@ class OpenAIClient {
     }
 
     private val httpClient = OkHttpClient.Builder()
+        .callTimeout(90, TimeUnit.SECONDS)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
@@ -55,8 +155,9 @@ class OpenAIClient {
         tools: JsonArray,
         apiEndpoint: String,
         apiKey: String,
-        modelName: String
-    ): Result<AIChatResult> = withContext(Dispatchers.IO) {
+        modelName: String,
+        logHttp: ((HttpLogEntry) -> Unit)? = null
+    ): Result<ToolChatResponse> = withContext(Dispatchers.IO) {
         runCatching {
             val requestBody = buildToolRequestBody(modelName, messages, tools)
             val requestJson = json.encodeToString(requestBody)
@@ -74,8 +175,13 @@ class OpenAIClient {
                 .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
-            val responseBody = executeRequest(request)
-            parseToolResponse(responseBody)
+            logHttp?.invoke(buildRequestLog(request, requestJson))
+
+            val response = executeRequest(request, logHttp)
+            ToolChatResponse(
+                result = parseToolResponse(response.body),
+                timing = response.timing
+            )
         }
     }
 
@@ -95,6 +201,8 @@ class OpenAIClient {
             put("messages", messages)
             put("tools", tools)
             put("tool_choice", "auto")
+            put("parallel_function_calls", true)
+            put("parallel_tool_calls", true)
             if (!usesNewTokenParam) {
                 put("temperature", 0.1)
             }
@@ -187,9 +295,16 @@ class OpenAIClient {
         }
     }
 
-    private suspend fun executeRequest(request: Request): String {
+    private suspend fun executeRequest(
+        request: Request,
+        logHttp: ((HttpLogEntry) -> Unit)?
+    ): ExecutedRequest {
         return suspendCancellableCoroutine { continuation ->
-            val call = httpClient.newCall(request)
+            val timingCollector = CallTimingCollector()
+            val call = httpClient.newBuilder()
+                .eventListener(timingCollector)
+                .build()
+                .newCall(request)
 
             continuation.invokeOnCancellation {
                 call.cancel()
@@ -197,6 +312,20 @@ class OpenAIClient {
 
             call.enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
+                    val timing = timingCollector.snapshot()
+                    logHttp?.invoke(
+                        HttpLogEntry(
+                            title = "AI 请求失败",
+                            content = buildString {
+                                appendLine("Method: ${request.method}")
+                                appendLine("URL: ${request.url}")
+                                appendLine("Error: ${e.message}")
+                                appendLine("total_ms: ${timing.totalMs}")
+                                timing.uploadMs?.let { appendLine("upload_ms: $it") }
+                                timing.modelMs?.let { appendLine("model_ms: $it") }
+                            }.trimEnd()
+                        )
+                    )
                     if (!continuation.isCancelled) {
                         continuation.resumeWithException(
                             RuntimeException("Network request failed: ${e.message}", e)
@@ -207,6 +336,13 @@ class OpenAIClient {
                 override fun onResponse(call: Call, response: Response) {
                     try {
                         val body = response.body?.string() ?: ""
+                        val timing = timingCollector.snapshot()
+                        logHttp?.invoke(
+                            HttpLogEntry(
+                                title = "AI 响应详情",
+                                content = buildResponseLog(response, body, timing)
+                            )
+                        )
 
                         if (!response.isSuccessful) {
                             val errorMsg = try {
@@ -221,7 +357,7 @@ class OpenAIClient {
                             return
                         }
 
-                        continuation.resume(body)
+                        continuation.resume(ExecutedRequest(body = body, timing = timing))
                     } catch (e: Exception) {
                         continuation.resumeWithException(
                             RuntimeException("Failed to read response: ${e.message}", e)
@@ -230,6 +366,159 @@ class OpenAIClient {
                 }
             })
         }
+    }
+
+    private data class EmbeddedImageSummary(
+        val mimeType: String,
+        val base64Chars: Int,
+        val image: DebugLogImage
+    ) {
+        val estimatedBytes: Long
+            get() = if (base64Chars <= 0) 0L else (base64Chars.toLong() * 3L) / 4L
+    }
+
+    private data class RequestLogPresentation(
+        val body: String,
+        val images: List<DebugLogImage> = emptyList()
+    )
+
+    private fun buildRequestLog(request: Request, requestJson: String): HttpLogEntry {
+        val presentation = formatRequestBodyForLog(requestJson)
+        return HttpLogEntry(
+            title = "AI 请求详情",
+            content = buildString {
+                appendLine("Method: ${request.method}")
+                appendLine("URL: ${request.url}")
+                appendLine("Headers:")
+                appendLine(formatHeaders(request.headers))
+                appendLine("Body:")
+                append(presentation.body)
+            },
+            imageBase64 = presentation.images.firstOrNull()?.base64,
+            imageMimeType = presentation.images.firstOrNull()?.mimeType,
+            images = presentation.images
+        )
+    }
+
+    private fun buildResponseLog(
+        response: Response,
+        body: String,
+        timing: RequestTiming
+    ): String = buildString {
+        appendLine("Status: ${response.code} ${response.message}")
+        appendLine("URL: ${response.request.url}")
+        appendLine("Timings:")
+        appendLine("  total_ms: ${timing.totalMs}")
+        timing.uploadMs?.let { appendLine("  upload_ms: $it") }
+        timing.modelMs?.let { appendLine("  model_ms: $it") }
+        appendLine("Headers:")
+        appendLine(formatHeaders(response.headers))
+        appendLine("Body:")
+        append(body.ifBlank { "<empty>" })
+    }
+
+    private fun formatHeaders(headers: Headers): String {
+        if (headers.size == 0) return "  <none>"
+        return headers.names()
+            .sorted()
+            .joinToString("\n") { name ->
+                val value = if (name.equals("Authorization", ignoreCase = true)) {
+                    redactAuthorization(headers[name].orEmpty())
+                } else {
+                    headers.values(name).joinToString(", ")
+                }
+                "  $name: $value"
+            }
+    }
+
+    private fun redactAuthorization(value: String): String {
+        if (value.isBlank()) return value
+        val trimmed = value.trim()
+        val parts = trimmed.split(" ", limit = 2)
+        if (parts.size != 2) return "***"
+        val scheme = parts[0]
+        val token = parts[1]
+        val visible = token.takeLast(minOf(6, token.length))
+        return "$scheme ***$visible"
+    }
+
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    private fun formatRequestBodyForLog(requestJson: String): RequestLogPresentation {
+        return try {
+            val imageSummaries = mutableListOf<EmbeddedImageSummary>()
+            val parsed = json.parseToJsonElement(requestJson)
+            val sanitized = sanitizeJsonElementForLog(parsed, imageSummaries)
+            val prettyJson = Json {
+                prettyPrint = true
+            }.encodeToString(sanitized)
+
+            val body = if (imageSummaries.isEmpty()) {
+                prettyJson
+            } else {
+                buildString {
+                    appendLine("Embedded images: ${imageSummaries.size}")
+                    imageSummaries.forEachIndexed { index, summary ->
+                        appendLine(
+                            "  - #${index + 1}: ${summary.mimeType}, " +
+                                formatByteCount(summary.estimatedBytes) +
+                                ", base64=${summary.base64Chars} chars"
+                        )
+                    }
+                    append(prettyJson)
+                }.trimEnd()
+            }
+            RequestLogPresentation(
+                body = body,
+                images = imageSummaries.map { it.image }
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to sanitize request body for logging", e)
+            RequestLogPresentation(body = requestJson)
+        }
+    }
+
+    private fun sanitizeJsonElementForLog(
+        element: JsonElement,
+        imageSummaries: MutableList<EmbeddedImageSummary>
+    ): JsonElement {
+        return when (element) {
+            is JsonObject -> JsonObject(
+                element.mapValues { (_, value) -> sanitizeJsonElementForLog(value, imageSummaries) }
+            )
+
+            is JsonArray -> JsonArray(
+                element.map { item -> sanitizeJsonElementForLog(item, imageSummaries) }
+            )
+
+            is JsonPrimitive -> {
+                val match = DATA_IMAGE_URL_REGEX.matchEntire(element.content)
+                if (match != null) {
+                    val mimeType = match.groupValues[1]
+                    val base64Data = match.groupValues[2]
+                    val summary = EmbeddedImageSummary(
+                        mimeType = mimeType,
+                        base64Chars = base64Data.length,
+                        image = DebugLogImage(base64 = base64Data, mimeType = mimeType)
+                    )
+                    imageSummaries += summary
+                    JsonPrimitive(
+                        "<embedded image omitted: ${summary.mimeType}, " +
+                            "${formatByteCount(summary.estimatedBytes)}, " +
+                            "base64=${summary.base64Chars} chars>"
+                    )
+                } else {
+                    element
+                }
+            }
+        }
+    }
+
+    private fun formatByteCount(bytes: Long): String {
+        if (bytes < 1024) return "${bytes}B"
+        val kb = bytes / 1024.0
+        if (kb < 1024) return String.format("%.1fKB", kb)
+        val mb = kb / 1024.0
+        return String.format("%.2fMB", mb)
     }
 
     /**
@@ -263,7 +552,7 @@ class OpenAIClient {
                 .post(requestJson.toRequestBody(JSON_MEDIA_TYPE))
                 .build()
 
-            val responseBody = executeRequest(request)
+            val responseBody = executeRequest(request, null).body
             val chatResponse = json.decodeFromString<ChatResponse>(responseBody)
             chatResponse.choices.firstOrNull()?.message?.content ?: ""
         }

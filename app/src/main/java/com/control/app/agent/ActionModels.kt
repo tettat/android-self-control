@@ -31,13 +31,34 @@ sealed class AIChatResult {
 
 // --- Debug / state models (unchanged) ---
 
+data class DebugLogImage(
+    val base64: String,
+    val mimeType: String? = null
+)
+
 data class DebugLogEntry(
     val id: String = UUID.randomUUID().toString(),
     val timestamp: Long = System.currentTimeMillis(),
     val type: DebugLogType,
     val title: String,
     val content: String,
-    val imageBase64: String? = null
+    val imageBase64: String? = null,
+    val imageMimeType: String? = null,
+    val images: List<DebugLogImage> = imageBase64?.let {
+        listOf(DebugLogImage(base64 = it, mimeType = imageMimeType))
+    } ?: emptyList()
+)
+
+fun DebugLogEntry.withImages(images: List<DebugLogImage>): DebugLogEntry = copy(
+    imageBase64 = images.firstOrNull()?.base64,
+    imageMimeType = images.firstOrNull()?.mimeType,
+    images = images
+)
+
+fun DebugLogEntry.withoutImages(): DebugLogEntry = copy(
+    imageBase64 = null,
+    imageMimeType = null,
+    images = emptyList()
 )
 
 enum class DebugLogType {
@@ -50,11 +71,57 @@ enum class DebugLogType {
     INFO
 }
 
+data class TimingBreakdown(
+    val screenshotMs: Long? = null,
+    val uiDumpMs: Long? = null,
+    val encodeMs: Long? = null,
+    val uploadMs: Long? = null,
+    val modelMs: Long? = null,
+    val toolMs: Long? = null
+) {
+    fun merge(other: TimingBreakdown): TimingBreakdown = TimingBreakdown(
+        screenshotMs = other.screenshotMs ?: screenshotMs,
+        uiDumpMs = other.uiDumpMs ?: uiDumpMs,
+        encodeMs = other.encodeMs ?: encodeMs,
+        uploadMs = other.uploadMs ?: uploadMs,
+        modelMs = other.modelMs ?: modelMs,
+        toolMs = other.toolMs ?: toolMs
+    )
+
+    fun isEmpty(): Boolean =
+        screenshotMs == null &&
+            uiDumpMs == null &&
+            encodeMs == null &&
+            uploadMs == null &&
+            modelMs == null &&
+            toolMs == null
+}
+
+data class StepTiming(
+    val label: String,
+    val tool: String = "",
+    val toolArguments: String = "",
+    val intent: String = "",
+    val startedAtMs: Long,
+    val finishedAtMs: Long,
+    val durationMs: Long,
+    val breakdown: TimingBreakdown = TimingBreakdown()
+)
+
 data class AgentState(
     val isRunning: Boolean = false,
     val currentRound: Int = 0,
     val maxRounds: Int = 50,
     val statusMessage: String = "就绪",
     val isListening: Boolean = false,
-    val lastThinking: String = ""
+    val lastThinking: String = "",
+    val activeTool: String = "",
+    val lastAction: String = "",
+    val currentToolArguments: String = "",
+    val currentStepIntent: String = "",
+    val taskStartedAtMs: Long = 0L,
+    val phaseStartedAtMs: Long = 0L,
+    val lastProgressAtMs: Long = 0L,
+    val currentPhaseTiming: TimingBreakdown = TimingBreakdown(),
+    val stepTimings: List<StepTiming> = emptyList()
 )

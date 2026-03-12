@@ -4,7 +4,6 @@ import android.Manifest
 import android.app.Application
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -35,6 +34,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -45,6 +45,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Mic
@@ -74,6 +76,7 @@ import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -102,9 +105,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavController
 import androidx.core.content.FileProvider
 import com.control.app.ControlApp
+import com.control.app.prompt.DefaultPrompts
 import com.control.app.agent.AgentState
 import com.control.app.agent.DebugLogEntry
 import com.control.app.agent.DebugLogType
+import com.control.app.agent.StepTiming
+import com.control.app.log.ExecutionLogFormatter
 import com.control.app.service.FloatingBubbleService
 import com.control.app.ui.navigation.Routes
 import com.control.app.ui.theme.GradientColors
@@ -113,9 +119,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -125,6 +130,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val app = application as ControlApp
     val agentState = app.agentEngine.agentState
     val debugLog = app.agentEngine.debugLog
+    val adbStartupState = app.adbStartupState
 
     private val _voiceText = MutableStateFlow("")
     val voiceText: StateFlow<String> = _voiceText.asStateFlow()
@@ -232,14 +238,15 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun executeCommand(command: String) {
-        val job = viewModelScope.launch {
-            app.agentEngine.executeCommand(command)
-        }
-        app.agentEngine.setCurrentJob(job)
+        app.agentEngine.submitCommand(command = command, scope = viewModelScope)
     }
 
     fun cancelExecution() {
         app.agentEngine.cancel()
+    }
+
+    fun ensureAdbReady() {
+        app.ensureAdbReady()
     }
 
     /**
@@ -250,41 +257,23 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
         if (entries.isEmpty()) return null
 
         try {
-            val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
-            val timestampFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.getDefault())
-
-            val root = JSONObject().apply {
-                put("exportTime", dateFormat.format(Date()))
-                put("deviceInfo", "${Build.MANUFACTURER} ${Build.MODEL} (Android ${Build.VERSION.RELEASE}, SDK ${Build.VERSION.SDK_INT})")
-                put("appVersion", try {
-                    val pInfo = app.packageManager.getPackageInfo(app.packageName, 0)
-                    "${pInfo.versionName} (${pInfo.longVersionCode})"
-                } catch (_: Exception) { "unknown" })
-                put("entryCount", entries.size)
-
-                val jsonEntries = JSONArray()
-                for (entry in entries) {
-                    val obj = JSONObject().apply {
-                        put("id", entry.id)
-                        put("timestamp", entry.timestamp)
-                        put("timestampFormatted", timestampFormat.format(Date(entry.timestamp)))
-                        put("type", entry.type.name)
-                        put("title", entry.title)
-                        put("content", entry.content)
-                        put("hasImage", entry.imageBase64 != null)
-                        if (entry.imageBase64 != null) {
-                            put("imageSizeKB", entry.imageBase64.length * 3 / 4 / 1024)
-                        }
-                    }
-                    jsonEntries.put(obj)
-                }
-                put("entries", jsonEntries)
-            }
+            val logServerStatus = app.executionLogHttpServer.status.value
+            val root = ExecutionLogFormatter.buildExportJson(
+                context = app,
+                agentState = app.agentEngine.agentState.value,
+                entries = entries,
+                sessions = app.sessionManager.sessions.value,
+                serverPort = logServerStatus.port.takeIf { it > 0 },
+                accessUrls = logServerStatus.accessUrls
+            )
 
             val debugDir = app.getExternalFilesDir("debug") ?: return null
             if (!debugDir.exists()) debugDir.mkdirs()
 
-            val fileTimestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())
+            val fileTimestamp = ExecutionLogFormatter.buildExportTime()
+                .replace(":", "")
+                .replace("-", "")
+                .replace("T", "_")
             val file = File(debugDir, "control_debug_$fileTimestamp.json")
             file.writeText(root.toString(2))
 
@@ -316,9 +305,17 @@ fun HomeScreen(
 ) {
     val agentState by viewModel.agentState.collectAsStateWithLifecycle()
     val debugLog by viewModel.debugLog.collectAsStateWithLifecycle()
+    val adbStartupState by viewModel.adbStartupState.collectAsStateWithLifecycle()
     val voiceText by viewModel.voiceText.collectAsStateWithLifecycle()
     val isListening by viewModel.isListening.collectAsStateWithLifecycle()
     val partialText by viewModel.partialText.collectAsStateWithLifecycle()
+    val nowMs by produceState(initialValue = System.currentTimeMillis(), key1 = agentState.isRunning) {
+        value = System.currentTimeMillis()
+        while (agentState.isRunning) {
+            delay(1000)
+            value = System.currentTimeMillis()
+        }
+    }
 
     val context = LocalContext.current
     var hasAudioPermission by remember {
@@ -343,7 +340,11 @@ fun HomeScreen(
     }
 
     // Text input state
-    var textInput by remember { mutableStateOf("") }
+    var textInput by remember { mutableStateOf(DefaultPrompts.DEFAULT_INSTRUCTION) }
+
+    LaunchedEffect(Unit) {
+        viewModel.ensureAdbReady()
+    }
 
     Scaffold(
         topBar = {
@@ -475,11 +476,21 @@ fun HomeScreen(
 
                 Spacer(modifier = Modifier.height(8.dp))
 
+                AdbStartupCard(
+                    state = adbStartupState,
+                    onOpenSettings = { navController.navigate(Routes.SETTINGS) }
+                )
+
+                if (adbStartupState.message != null) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+
                 // Status text
                 StatusIndicator(
                     agentState = agentState,
                     isListening = isListening,
-                    partialText = partialText
+                    partialText = partialText,
+                    nowMs = nowMs
                 )
 
                 Spacer(modifier = Modifier.height(8.dp))
@@ -560,7 +571,7 @@ fun HomeScreen(
                         keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                         keyboardActions = KeyboardActions(
                             onSend = {
-                                if (textInput.isNotBlank() && !agentState.isRunning) {
+                                if (textInput.isNotBlank() && !agentState.isRunning && !adbStartupState.isConnecting) {
                                     viewModel.executeCommand(textInput.trim())
                                     textInput = ""
                                 }
@@ -570,17 +581,17 @@ fun HomeScreen(
                     Spacer(modifier = Modifier.width(8.dp))
                     IconButton(
                         onClick = {
-                            if (textInput.isNotBlank() && !agentState.isRunning) {
+                            if (textInput.isNotBlank() && !agentState.isRunning && !adbStartupState.isConnecting) {
                                 viewModel.executeCommand(textInput.trim())
                                 textInput = ""
                             }
                         },
-                        enabled = textInput.isNotBlank() && !agentState.isRunning
+                        enabled = textInput.isNotBlank() && !agentState.isRunning && !adbStartupState.isConnecting
                     ) {
                         Icon(
                             imageVector = Icons.Filled.Send,
                             contentDescription = "发送",
-                            tint = if (textInput.isNotBlank() && !agentState.isRunning)
+                            tint = if (textInput.isNotBlank() && !agentState.isRunning && !adbStartupState.isConnecting)
                                 MaterialTheme.colorScheme.primary
                             else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
                         )
@@ -612,6 +623,75 @@ fun HomeScreen(
                     containerColor = MaterialTheme.colorScheme.error,
                     contentColor = MaterialTheme.colorScheme.onError
                 )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AdbStartupCard(
+    state: ControlApp.AdbStartupState,
+    onOpenSettings: () -> Unit
+) {
+    if (state.isReady || state.message.isNullOrBlank()) return
+
+    Card(
+        colors = CardDefaults.cardColors(
+            containerColor = if (state.needsPairing) {
+                MaterialTheme.colorScheme.errorContainer
+            } else {
+                MaterialTheme.colorScheme.surfaceContainerHigh
+            }
+        ),
+        shape = RoundedCornerShape(16.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(
+                        if (state.needsPairing) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            StatusColors.Processing
+                        }
+                    )
+            )
+            Spacer(modifier = Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = if (state.needsPairing) "ADB 未配对" else "ADB 连接中",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = if (state.needsPairing) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurface
+                    }
+                )
+                Text(
+                    text = state.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = if (state.needsPairing) {
+                        MaterialTheme.colorScheme.onErrorContainer
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    }
+                )
+            }
+            if (state.needsPairing) {
+                TextButton(onClick = onOpenSettings) {
+                    Text("去设置")
+                }
             }
         }
     }
@@ -734,7 +814,8 @@ private fun MicButton(
 private fun StatusIndicator(
     agentState: AgentState,
     isListening: Boolean,
-    partialText: String
+    partialText: String,
+    nowMs: Long
 ) {
     val statusText: String
     val statusColor: Color
@@ -754,23 +835,159 @@ private fun StatusIndicator(
         }
     }
 
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.Center
+    val totalSeconds = if (agentState.taskStartedAtMs > 0L) {
+        ((nowMs - agentState.taskStartedAtMs).coerceAtLeast(0L)) / 1000
+    } else 0L
+    val stepSeconds = if (agentState.phaseStartedAtMs > 0L) {
+        ((nowMs - agentState.phaseStartedAtMs).coerceAtLeast(0L)) / 1000
+    } else 0L
+    val idleSeconds = if (agentState.lastProgressAtMs > 0L) {
+        ((nowMs - agentState.lastProgressAtMs).coerceAtLeast(0L)) / 1000
+    } else 0L
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Box(
-            modifier = Modifier
-                .size(8.dp)
-                .clip(CircleShape)
-                .background(statusColor)
-        )
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-            text = statusText,
-            style = MaterialTheme.typography.titleMedium,
-            color = statusColor
-        )
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(8.dp)
+                    .clip(CircleShape)
+                    .background(statusColor)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = statusText,
+                style = MaterialTheme.typography.titleMedium,
+                color = statusColor
+            )
+        }
+
+        if (agentState.isRunning) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = buildString {
+                    append("总耗时 ${formatDuration(totalSeconds)}")
+                    append(" | 当前步骤耗时 ${formatDuration(stepSeconds)}")
+                    if (idleSeconds >= 5) {
+                        append(" | 无新进展 ${formatDuration(idleSeconds)}")
+                    }
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            if (agentState.activeTool.isNotBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "当前工具: ${agentState.activeTool}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+
+            if (agentState.lastAction.isNotBlank()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                    text = "最近进展: ${agentState.lastAction}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        } else if (agentState.stepTimings.isNotEmpty()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "总耗时 ${formatDuration(totalSeconds)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            StepTimingSummary(stepTimings = agentState.stepTimings)
+        }
     }
+}
+
+@Composable
+private fun StepTimingSummary(stepTimings: List<StepTiming>) {
+    Column(
+        horizontalAlignment = Alignment.Start,
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 220.dp)
+            .verticalScroll(rememberScrollState())
+    ) {
+        Text(
+            text = "步骤耗时",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurface
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        stepTimings.forEachIndexed { index, step ->
+            val presentation = ExecutionLogFormatter.describeStepTiming(step)
+            val breakdownSummary = ExecutionLogFormatter.formatTimingBreakdown(step.breakdown)
+            Text(
+                text = "${index + 1}. [${presentation.category}] ${presentation.title}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = "耗时 ${ExecutionLogFormatter.formatDurationMs(step.durationMs)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary
+            )
+            if (breakdownSummary.isNotBlank()) {
+                Text(
+                    text = breakdownSummary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.secondary
+                )
+            }
+            if (presentation.subtitle.isNotBlank()) {
+                Text(
+                    text = presentation.subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (step.toolArguments.isNotBlank()) {
+                Text(
+                    text = "参数 ${step.toolArguments}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (step.intent.isNotBlank()) {
+                Text(
+                    text = "意图 ${step.intent}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            if (index != stepTimings.lastIndex) {
+                Spacer(modifier = Modifier.height(6.dp))
+            }
+        }
+    }
+}
+
+private fun formatDuration(totalSeconds: Long): String {
+    val minutes = totalSeconds / 60
+    val seconds = totalSeconds % 60
+    return if (minutes > 0) "${minutes}m${seconds}s" else "${seconds}s"
 }
 
 @Composable
